@@ -25,6 +25,7 @@ import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
+import { GuardBridgeRejection, type GuardEntryPathId, getGuardBridgeAdvertisement } from "./guard-bridge.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
@@ -34,7 +35,7 @@ import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
-import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
+import { applyAndEmitLoaded, getGuardExpectedDiagnostic, getGuardRegistrantDiagnostic, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
@@ -76,6 +77,24 @@ import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./workt
 import { escapeXml } from "./xml.js";
 
 // ---- Shared helpers ----
+
+function ingressSessionTarget(ctx: any): string {
+  const sessionId = ctx?.sessionManager?.getSessionId?.();
+  return typeof sessionId === "string" && sessionId.length > 0 ? `session:${sessionId}` : "session:unknown";
+}
+
+function isIngressCapturePending(value: unknown): value is Promise<unknown> {
+  return value !== null && (typeof value === "object" || typeof value === "function") && typeof (value as Promise<unknown>).then === "function";
+}
+
+function reportDeferredSteerFailure(entryPath: GuardEntryPathId, error: unknown, ui?: { notify(message: string, level?: "info" | "warning" | "error"): void }): void {
+  if (error instanceof GuardBridgeRejection) {
+    ui?.notify(error.message, "warning");
+  } else {
+    console.warn(`[pi-subagents] Deferred steer stopped at ${entryPath}.`);
+  }
+}
+
 
 /** Tool execute return value for a text response. */
 function textResult(msg: string, details?: AgentDetails) {
@@ -646,6 +665,39 @@ export default function (pi: ExtensionAPI) {
     if (reportUsage) pendingUsage.add(usage);
   });
 
+  let guardRegistrationWindowActive = false;
+  let guardReadyEmitted = false;
+  let reemittingReadyForRejectedRegistration = false;
+  let rejectedReadyEmissionsThisSession = 0;
+  const rejectedReadyReasonsThisSession = new Set<string>();
+  const MAX_REJECTED_READY_EMISSIONS_PER_SESSION = 3;
+  const resetRejectedReadyEmissions = () => {
+    rejectedReadyEmissionsThisSession = 0;
+    rejectedReadyReasonsThisSession.clear();
+  };
+  pi.events.on("subagents:guard:register", (registration: unknown) => {
+    const result = guardRegistrationWindowActive
+      ? manager.registerGuard(registration)
+      : manager.rejectGuardRegistration("registration rejected because there is no active session; register after subagents:ready and before session shutdown/switch.");
+    const rejectionReason = result.registrationRejected;
+    if (
+      rejectionReason !== undefined &&
+      guardRegistrationWindowActive &&
+      !reemittingReadyForRejectedRegistration &&
+      rejectedReadyEmissionsThisSession < MAX_REJECTED_READY_EMISSIONS_PER_SESSION &&
+      !rejectedReadyReasonsThisSession.has(rejectionReason)
+    ) {
+      rejectedReadyReasonsThisSession.add(rejectionReason);
+      rejectedReadyEmissionsThisSession++;
+      reemittingReadyForRejectedRegistration = true;
+      try {
+        pi.events.emit("subagents:ready", { guardBridge: getGuardBridgeAdvertisement(manager.guardBridgeHost) });
+      } finally {
+        reemittingReadyForRejectedRegistration = false;
+      }
+    }
+  });
+
   // Expose manager via Symbol.for() global registry for cross-package access.
   // Standard Node.js pattern for cross-package singletons (used by OpenTelemetry, etc.).
   // Documented for callers in docs/rpc.md ("The manager registry").
@@ -695,7 +747,7 @@ export default function (pi: ExtensionAPI) {
     return id;
   };
 
-  const spawnTopLevel = (piRef: any, ctxRef: any, type: string, prompt: string, options: any) => {
+  const spawnTopLevel = (piRef: any, ctxRef: any, type: string, prompt: string, options: any, internalGuardEntryPath?: GuardEntryPathId) => {
     const safeOptions = { ...(options ?? {}) };
     delete safeOptions.parentAgentId;
     // Internal too: a forged value would hide an RPC-spawned agent inside
@@ -718,6 +770,11 @@ export default function (pi: ExtensionAPI) {
     // awaits nothing. A forged `blocking` would charge it to the foreground
     // pool and could defer it behind a queue whose gate nobody is holding.
     delete safeOptions.blocking;
+    // Bridge metadata is an internal capability, never caller-controlled over
+    // RPC or the manager registry.
+    delete safeOptions.guardBridgeRegistration;
+    delete safeOptions.guardEntryPath;
+    if (internalGuardEntryPath !== undefined) safeOptions.guardEntryPath = internalGuardEntryPath;
     return spawnResolved(piRef, ctxRef, type, prompt, safeOptions);
   };
 
@@ -738,7 +795,23 @@ export default function (pi: ExtensionAPI) {
   const registryEntry = {
     waitForAll: () => manager.waitForAll(),
     hasRunning: () => manager.hasRunning(),
-    spawn: spawnTopLevel,
+    spawn: (piRef: any, ctxRef: any, type: string, prompt: string, options: any) => {
+      const rawText = typeof prompt === "string" ? prompt : "";
+      const capture = manager.captureIngress({
+        rawText,
+        coverage: typeof prompt === "string" ? "partial" : "unknown",
+        target: ingressSessionTarget(ctxRef),
+        origin: "extension-request",
+        entryPath: "manager-registry.spawn",
+      });
+      if (isIngressCapturePending(capture)) {
+        return capture.then((evidence) => {
+          manager.assertIngressCaptureActive(evidence, "manager-registry.spawn");
+          return spawnTopLevel(piRef, ctxRef, type, prompt, options, "manager-registry.spawn");
+        });
+      }
+      return spawnTopLevel(piRef, ctxRef, type, prompt, options, "manager-registry.spawn");
+    },
     getRecord: (id: string) => {
       const record = manager.getRecord(id);
       return record !== undefined && isTopLevelAgent(record) ? record : undefined;
@@ -787,6 +860,8 @@ export default function (pi: ExtensionAPI) {
   // This also wires the RPC handlers and broadcasts readiness — on the first
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
+    resetRejectedReadyEmissions();
+    guardRegistrationWindowActive = true;
     currentCtx = ctx;
     if (ctx.hasUI) {
       widget.setUICtx(ctx.ui);
@@ -800,8 +875,11 @@ export default function (pi: ExtensionAPI) {
         events: pi.events,
         pi,
         getCtx: () => currentCtx,
+        guardBridgeAdvertisement: () => getGuardBridgeAdvertisement(manager.guardBridgeHost),
         manager: {
           spawn: spawnTopLevel,
+          assertGuard: (entryPath) => manager.assertGuard(entryPath),
+          captureIngress: (input) => manager.captureIngress(input),
           awaitStartup: (id) => manager.awaitStartup(id),
           getRecord: (id) => manager.getRecord(id),
           // Unguarded on purpose: the stop handler now runs the top-level check
@@ -824,7 +902,14 @@ export default function (pi: ExtensionAPI) {
       // Broadcast readiness so extensions loaded alongside us can discover us.
       // Emitting after all factories have run (rather than at factory time)
       // also avoids the race where a consumer loaded after us misses the event.
-      pi.events.emit("subagents:ready", {});
+    }
+    // Readiness is session-scoped, not RPC-handler-scoped: /new and /resume keep
+    // this extension instance and its RPC listeners but reset guard registration.
+    if (!guardReadyEmitted) {
+      guardReadyEmitted = true;
+      // Broadcast readiness after every real session_start so extensions can
+      // discover and register after a switch. Filtered sessions never arrive here.
+      pi.events.emit("subagents:ready", { guardBridge: getGuardBridgeAdvertisement(manager.guardBridgeHost) });
     }
     if (isSchedulingEnabled() && !scheduler.isActive()) startScheduler(ctx);
     // Stack `@handle` suggestions on pi's built-in autocomplete. Registered at
@@ -889,6 +974,30 @@ export default function (pi: ExtensionAPI) {
     const mention = parseMention(event.text);
     if (!mention) return { action: "continue" };
 
+    // A typed mention is still the user's original input. When mandatory guard
+    // registration is absent or incompatible, do not consume it or rewrite it;
+    // let the normal prompt path receive the exact text instead.
+    const guardUnavailable = async (entryPath: GuardEntryPathId, target: string): Promise<boolean> => {
+      try {
+      manager.assertGuard(entryPath);
+
+        const capture = await manager.captureIngress({
+          rawText: event.text,
+          transformedText: mention.message,
+          coverage: "complete",
+          target,
+          origin: "human",
+          entryPath,
+        });
+        manager.assertIngressCaptureActive(capture, entryPath);
+        return false;
+      } catch (error) {
+        if (!(error instanceof GuardBridgeRejection)) throw error;
+        ctx.ui.notify(error.message, "warning");
+        return true;
+      }
+    };
+
     // `@main` addresses the main conversation, never a subagent — the one name
     // `assignHandle` refuses to allocate. An explicit escape hatch for text
     // that would otherwise read as a mention, so the prefix is dropped and the
@@ -914,6 +1023,7 @@ export default function (pi: ExtensionAPI) {
       const target = `@${record.alias ?? record.handle ?? mention.handle}`;
 
       if (record.status === "running" || record.status === "queued") {
+        if (await guardUnavailable("mention.input-steer", `agent:${record.id}`)) return { action: "continue" };
         // Steering interrupts after the current tool call, exactly like the
         // steer_subagent tool. Un-consume the result so the agent's reply to
         // this message is still relayed even if the LLM read its last answer.
@@ -930,7 +1040,9 @@ export default function (pi: ExtensionAPI) {
         // must keep holding, since record.outputFile is the sole gate every
         // downstream consumer keys off and a resume must not re-open it.
         const config = getAgentConfig(record.type);
+        if (await guardUnavailable("mention.input-resume", `agent:${record.id}`)) return { action: "continue" };
         const resumedRecord = await startBackgroundResume(ctx, record, mention.message, {
+          guardEntryPath: "mention.input-resume",
           outputTranscript: config?.outputTranscript ?? getOutputTranscriptDefault(),
           maxTurns: normalizeMaxTurns(config?.maxTurns ?? getDefaultMaxTurns()),
         });
@@ -952,6 +1064,15 @@ export default function (pi: ExtensionAPI) {
     if (resolved?.kind === "tombstone") {
       const entry = resolved.entry;
       const target = `@${entry.alias ?? entry.handle}`;
+      try {
+        if (await guardUnavailable("mention.input-resume", `session:${entry.sessionFile}`)) return { action: "continue" };
+      } catch (err) {
+        ctx.ui.notify(
+          `Could not resume ${target}: ${err instanceof Error ? err.message : String(err)}`,
+          "warning",
+        );
+        return { action: "handled" };
+      }
 
       // Checked here rather than left to SessionManager.open: that runs inside
       // runAgent, whose rejection lands on the record as an agent error, not in
@@ -986,6 +1107,7 @@ export default function (pi: ExtensionAPI) {
         // exception — both come from a tombstone this extension wrote.
         const id = spawnResolved(pi, ctx, dispatch.type, mention.message, {
           description: entry.description,
+          guardEntryPath: "mention.input-resume",
           reclaim: { handle: entry.handle, alias: entry.alias },
           resumeSessionFile: entry.sessionFile,
           isBackground: true,
@@ -1031,6 +1153,7 @@ export default function (pi: ExtensionAPI) {
     // prompt, off-screen, holding only the `Agent` tool. Nothing reaches the
     // chat, and what it starts is an ordinary top-level agent.
     if (getAgentMentionMode() === "model") {
+      if (await guardUnavailable("mention.input-clone", ingressSessionTarget(ctx))) return { action: "continue" };
       const label = `@${handleBase(type)}`;
       // "Prompting", not "Starting": in this mode nothing starts until the
       // off-screen clone has taken a whole model turn writing the agent's
@@ -1051,7 +1174,7 @@ export default function (pi: ExtensionAPI) {
             const id = spawnTopLevel(pi, ctx, type, mention.message, {
               description: describeMention(mention.message),
               isBackground: true,
-            });
+            }, "mention.input-start");
             // Same reason as the direct path below: the agent may still be
             // starting, and a failure there must reach this catch.
             await manager.awaitStartup(id);
@@ -1067,6 +1190,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     try {
+      if (await guardUnavailable("mention.input-start", ingressSessionTarget(ctx))) return { action: "continue" };
       // Nothing else to pass: runAgent resolves model, thinking and max turns
       // from the agent's own config when the spawn omits them, and the
       // manager's onStart/onComplete callbacks own the widget, the fleet list
@@ -1075,7 +1199,7 @@ export default function (pi: ExtensionAPI) {
       const id = spawnTopLevel(pi, ctx, type, mention.message, {
         description: describeMention(mention.message),
         isBackground: true,
-      });
+      }, "mention.input-start");
       // The agent may still be starting (a worktree copy is an awaited git
       // call) — report a failure that lands there as a failed start, not as a
       // "Started" toast for an agent that never ran.
@@ -1088,7 +1212,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_before_switch", () => {
+    guardRegistrationWindowActive = false;
+    guardReadyEmitted = false;
+    resetRejectedReadyEmissions();
     manager.clearCompleted(true);
+    manager.unregisterGuard();
     scheduler.stop();
   });
 
@@ -1098,9 +1226,14 @@ export default function (pi: ExtensionAPI) {
     rpcHandle?.unsubSpawn();
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
+    rpcHandle?.unsubGuardBridge();
     rpcHandle?.unsubConsume();
     rpcHandle = undefined;
     currentCtx = undefined;
+    guardRegistrationWindowActive = false;
+    guardReadyEmitted = false;
+    resetRejectedReadyEmissions();
+    manager.unregisterGuard();
     // Only release the global slot if this activation claimed it — a child
     // session's shutdown must not delete the root session's registry entry.
     if (ownsManagerRegistry && (globalThis as any)[MANAGER_KEY] === registryEntry) {
@@ -1279,8 +1412,10 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     existing: AgentRecord,
     prompt: string,
-    opts: { outputTranscript: boolean; maxTurns?: number; toolCallId?: string },
+    opts: { outputTranscript: boolean; maxTurns?: number; toolCallId?: string; guardEntryPath?: import("./guard-bridge.js").GuardEntryPathId },
   ): Promise<AgentRecord | undefined> {
+    manager.assertGuard(opts.guardEntryPath ?? "agent-manager.resume");
+
     const id = existing.id;
     const joinMode = resolveJoinMode(defaultJoinMode, true);
     // Assigned unconditionally: the completion notification carries this as
@@ -1312,6 +1447,7 @@ export default function (pi: ExtensionAPI) {
     // run_in_background in that same turn keep going.
     const record = await manager.resume(id, prompt, undefined, {
       isBackground: true,
+      ...(opts.guardEntryPath !== undefined ? { guardEntryPath: opts.guardEntryPath } : {}),
       onToolActivity: bgCallbacks.onToolActivity,
       onAssistantUsage: bgCallbacks.onAssistantUsage,
       // Fires when the run actually starts — immediately, or on queue
@@ -1420,6 +1556,8 @@ export default function (pi: ExtensionAPI) {
       setOutputTranscript: setOutputTranscriptDefault,
       setWorktreeIsolation: setWorktreeIsolationEnabled,
       setWorkflowsEnabled: setWorkflowsEnabled,
+      setGuardExpected: (expected) => manager.setGuardExpected(expected),
+      setGuardRegistrant: (registrant) => manager.setGuardRegistrant(registrant),
       setMaxSubagentDepth: setMaxSubagentDepth,
       setFallbackSubagent: setFallbackSubagent,
       setReportUsage,
@@ -1429,6 +1567,8 @@ export default function (pi: ExtensionAPI) {
     },
     (event, payload) => pi.events.emit(event, payload),
   );
+  manager.setGuardExpectedDiagnostic(getGuardExpectedDiagnostic());
+  manager.setGuardRegistrantDiagnostic(getGuardRegistrantDiagnostic());
 
   // ---- Agent tool ----
 
@@ -1941,6 +2081,16 @@ Terse command-style prompts produce shallow, generic work.
         if (!scheduler.isActive()) {
           return textResult("Scheduler is not active in this session yet. Try again after the session has fully started.");
         }
+        manager.assertGuard("agent-tool.schedule-create");
+        const capture = await manager.captureIngress({
+          rawText: params.prompt,
+          coverage: "complete",
+          target: ingressSessionTarget(ctx),
+          origin: "parent-model-delegation",
+          entryPath: "agent-tool.schedule-create",
+        });
+        manager.assertIngressCaptureActive(capture, "agent-tool.schedule-create");
+
         try {
           const job = scheduler.addJob({
             name: params.description as string,
@@ -1995,7 +2145,16 @@ Terse command-style prompts produce shallow, generic work.
             );
           }
 
+          await manager.captureIngress({
+            rawText: params.prompt,
+            coverage: "complete",
+            target: `agent:${existing.id}`,
+            origin: "parent-model-delegation",
+            entryPath: "agent-tool.resume-background",
+          });
+
           const record = await startBackgroundResume(ctx, existing, params.prompt, {
+            guardEntryPath: "agent-tool.resume-background",
             outputTranscript,
             maxTurns: effectiveMaxTurns,
             toolCallId,
@@ -2017,7 +2176,17 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
 
-        const record = await manager.resume(params.resume, params.prompt, signal);
+        await manager.captureIngress({
+          rawText: params.prompt,
+          coverage: "complete",
+          target: `agent:${existing.id}`,
+          origin: "parent-model-delegation",
+          entryPath: "agent-tool.resume-foreground",
+        });
+
+        const record = await manager.resume(params.resume, params.prompt, signal, {
+          guardEntryPath: "agent-tool.resume-foreground",
+        });
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
@@ -2033,6 +2202,7 @@ Terse command-style prompts produce shallow, generic work.
       }
 
       // Background execution
+
       if (runInBackground) {
         const { state: bgState, callbacks: bgCallbacks } = createActivityTracker(effectiveMaxTurns);
 
@@ -2052,8 +2222,17 @@ Terse command-style prompts produce shallow, generic work.
         // A throw here means the agent never started. Let it out: pi marks a
         // tool call failed only when execute throws, and a returned message
         // reads to the model as a subagent that ran and reported this (#179).
+        await manager.captureIngress({
+          rawText: params.prompt,
+          coverage: "complete",
+          target: ingressSessionTarget(ctx),
+          origin: "parent-model-delegation",
+          entryPath: "agent-tool.spawn-background",
+        });
+
         id = manager.spawn(pi, ctx, subagentType, params.prompt, {
           description: params.description,
+          guardEntryPath: "agent-tool.spawn-background",
           name: params.name as string | undefined,
           model,
           maxTurns: effectiveMaxTurns,
@@ -2122,6 +2301,15 @@ Terse command-style prompts produce shallow, generic work.
           { ...detailBaseFor(record), toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
         );
       }
+
+      await manager.captureIngress({
+        rawText: params.prompt,
+        coverage: "complete",
+        target: ingressSessionTarget(ctx),
+        origin: "parent-model-delegation",
+        entryPath: "agent-tool.spawn-foreground",
+      });
+
 
       // Foreground (synchronous) execution — stream progress via onUpdate
       let spinnerFrame = 0;
@@ -2208,6 +2396,7 @@ Terse command-style prompts produce shallow, generic work.
       try {
         const fgResult = await manager.spawnAndWait(pi, ctx, subagentType, params.prompt, {
           description: params.description,
+          guardEntryPath: "agent-tool.spawn-foreground",
           name: params.name as string | undefined,
           model,
           maxTurns: effectiveMaxTurns,
@@ -2492,6 +2681,7 @@ Terse command-style prompts produce shallow, generic work.
     },
 
     execute: async (toolCallId, params, _signal, _onUpdate, ctx) => {
+      manager.assertGuard("workflow-tool.dispatch");
       const resumeFrom = resolveResumeTarget(params.resumeFromRunId, workflowTasks);
       if (resumeFrom !== undefined && !resumeFrom.ok) return textResult(resumeFrom.message);
 
@@ -2661,6 +2851,7 @@ Terse command-style prompts produce shallow, generic work.
     if (workflowFlagHandled) return;
     const flag = pi.getFlag(WORKFLOW_FILE_FLAG);
     if (flag === undefined || flag === false) return;
+
     workflowFlagHandled = true;
 
     const report = (message: string, level: "info" | "warning") => {
@@ -2677,6 +2868,13 @@ Terse command-style prompts produce shallow, generic work.
           'or set `"workflowsEnabled": true` in .pi/subagents.json.',
         "warning",
       );
+      return;
+    }
+
+    try {
+      manager.assertGuard("workflow-cli-flag.dispatch");
+    } catch (error) {
+      report(error instanceof Error ? error.message : String(error), "warning");
       return;
     }
 
@@ -2834,6 +3032,8 @@ Terse command-style prompts produce shallow, generic work.
       }),
     }),
     execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
+      manager.assertGuard("agent-tool.steer");
+
       const record = resolveAgentRef(params.agent_id);
       if (!record || !isTopLevelAgent(record)) {
         return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
@@ -2841,6 +3041,13 @@ Terse command-style prompts produce shallow, generic work.
       if (record.status !== "running") {
         return textResult(`Agent "${params.agent_id}" is not running (status: ${record.status}). Cannot steer a non-running agent.`);
       }
+      await manager.captureIngress({
+        rawText: params.message,
+        coverage: "complete",
+        target: `agent:${record.id}`,
+        origin: "parent-model-delegation",
+        entryPath: "agent-tool.steer",
+      });
       if (!record.session) {
         // Session not ready yet — queue the steer for delivery once initialized
         if (!record.pendingSteers) record.pendingSteers = [];
@@ -3072,7 +3279,30 @@ Terse command-style prompts produce shallow, generic work.
           if (manager.abort(record.id)) {
             ctx.ui.notify(`Stopped "${record.description}".`, "info");
           }
-        }, keybindings, (message: string) => manager.steer(record.id, message), showCost, getViewerMarkdown, (mode) => chooseViewerMarkdown(mode, ctx));
+        }, keybindings, (message: string) => {
+          try {
+            manager.assertGuard("conversation-viewer.steer");
+            const capture = manager.captureIngress({
+              rawText: message,
+              coverage: "complete",
+              target: `agent:${record.id}`,
+              origin: "human",
+              entryPath: "conversation-viewer.steer",
+            });
+            if (isIngressCapturePending(capture)) {
+              void capture.then((evidence) => {
+                manager.assertIngressCaptureActive(evidence, "conversation-viewer.steer");
+                manager.steer(record.id, message);
+              }).catch((error) => reportDeferredSteerFailure("conversation-viewer.steer", error, ctx.ui));
+            } else {
+              manager.assertIngressCaptureActive(capture, "conversation-viewer.steer");
+              manager.steer(record.id, message);
+            }
+          } catch (error) {
+            if (!(error instanceof GuardBridgeRejection)) throw error;
+            ctx.ui.notify(error.message, "warning");
+          }
+        }, showCost, getViewerMarkdown, (mode) => chooseViewerMarkdown(mode, ctx));
       },
       {
         overlay: true,
@@ -3326,8 +3556,18 @@ Guidelines for choosing settings:
 
 Write the file using the write tool. Only write the file, nothing else.`;
 
+    await manager.captureIngress({
+      rawText: description,
+      transformedText: generatePrompt,
+      coverage: "complete",
+      target: ingressSessionTarget(ctx),
+      origin: "human",
+      entryPath: "agents-command.generate-definition",
+    });
+
     const { record } = await manager.spawnAndWait(pi, ctx, "general-purpose", generatePrompt, {
       description: `Generate ${name} agent`,
+      guardEntryPath: "agents-command.generate-definition",
       maxTurns: 5,
       // Exempt from maxConcurrentForeground. This runs from a modal wizard, not
       // a tool call: it passes no signal, and Esc in `ctx.ui` never reaches the
@@ -3465,6 +3705,10 @@ Write the file using the write tool. Only write the file, nothing else.`;
       // JSON.stringify, so unset stays unset — same reasoning as
       // `fallbackSubagent` below.
       workflowsEnabled: isWorkflowsPinned() ? isWorkflowsEnabled() : undefined,
+      // Configuration-only opt-in. The /agents snapshot must not persist its
+      // effective default, which could override a global requirement.
+      guardExpected: undefined,
+      guardRegistrant: undefined,
       maxSubagentDepth: getMaxSubagentDepth(),
       // Deliberately NOT `?? "general-purpose"`: every settings change writes the
       // whole snapshot, and materializing the implicit default would turn it into

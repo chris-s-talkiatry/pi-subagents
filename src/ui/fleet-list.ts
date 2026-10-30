@@ -14,6 +14,7 @@
 import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { hasAgentBadge, renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
+import { GuardBridgeRejection } from "../guard-bridge.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal } from "../usage.js";
 import { type AgentActivity, formatCost, type Theme } from "./agent-widget.js";
@@ -421,7 +422,32 @@ export class FleetList {
             if (this.manager.abort(record.id)) this.ui?.notify(`Stopped "${record.description}".`, "info");
           },
           keybindings,
-          (message: string) => this.manager.steer(record.id, message),
+          (message: string) => {
+            try {
+              this.manager.assertGuard?.("fleet-viewer.steer");
+              const capture = this.manager.captureIngress?.({
+                rawText: message,
+                coverage: "complete",
+                target: `agent:${record.id}`,
+                origin: "human",
+                entryPath: "fleet-viewer.steer",
+              });
+              if (capture && typeof (capture as Promise<unknown>).then === "function") {
+                void (capture as Promise<import("../guard-bridge.js").GuardIngressEvidence>).then((evidence) => {
+                  this.manager.assertIngressCaptureActive(evidence, "fleet-viewer.steer");
+                  this.manager.steer(record.id, message);
+                }).catch((error) => {
+                  if (error instanceof GuardBridgeRejection) this.ui?.notify(error.message, "warning");
+                  else console.warn("[pi-subagents] Deferred steer stopped at fleet-viewer.steer.");
+                });
+              } else {
+                this.manager.steer(record.id, message);
+              }
+            } catch (error) {
+              if (!(error instanceof GuardBridgeRejection)) throw error;
+              this.ui?.notify(error.message, "warning");
+            }
+          },
           this.showCost(),
           this.viewerMarkdown,
           this.onViewerMarkdown,

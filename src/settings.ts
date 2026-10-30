@@ -218,6 +218,10 @@ export interface SubagentsSettings {
    * fixed once pi has it.
    */
   workflowsEnabled?: boolean;
+  /** Require a compatible registered scope-guard bridge before guarded work. Defaults to false. */
+  guardExpected?: boolean;
+  /** Expected extension registrant id, required when guardExpected is true. */
+  guardRegistrant?: string;
   /**
    * Hard ceiling on nested subagent delegation, counted from the main session:
    * main = 0, its subagents = 1, their children = 2. Defaults to `2`; `0` or `1`
@@ -326,6 +330,8 @@ export interface SettingsAppliers {
   setOutputTranscript: (b: boolean) => void;
   setWorktreeIsolation: (b: boolean) => void;
   setWorkflowsEnabled: (b: boolean) => void;
+  setGuardExpected?: (b: boolean) => void;
+  setGuardRegistrant?: (registrant: string | undefined) => void;
   setMaxSubagentDepth: (n: number) => void;
   setFallbackSubagent: (v: string | undefined) => void;
   setReportUsage: (b: boolean) => void;
@@ -451,6 +457,12 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.workflowsEnabled === "boolean") {
     out.workflowsEnabled = r.workflowsEnabled;
   }
+  if (typeof r.guardExpected === "boolean") {
+    out.guardExpected = r.guardExpected;
+  }
+  if (typeof r.guardRegistrant === "string") {
+    out.guardRegistrant = r.guardRegistrant.trim();
+  }
   if (r.fallbackSubagent === false) {
     // The only non-string spelling worth accepting: a boolean would otherwise be
     // dropped, silently leaving the PERMISSIVE default in place. Every string is
@@ -472,25 +484,121 @@ function projectPath(cwd: string): string {
   return join(cwd, ".pi", "subagents.json");
 }
 
-/**
- * Read a settings file. Missing file is silent (returns `{}`). A file that
- * exists but can't be parsed emits a warning to stderr so users aren't
- * silently reverted to defaults — and still returns `{}` so startup proceeds.
- */
-function readSettingsFile(path: string): SubagentsSettings {
-  if (!existsSync(path)) return {};
+/** Read a settings file while retaining fail-closed diagnostics for guard configuration. */
+interface SettingsFileRead {
+  settings: SubagentsSettings;
+  guardExpectedDiagnostic?: string;
+  guardRegistrantDiagnostic?: string;
+}
+
+let guardExpectedDiagnostic: string | undefined;
+let guardRegistrantDiagnostic: string | undefined;
+const warnedGuardDiagnostics = new Set<string>();
+
+function warnGuardDiagnostic(path: string, reason: string): void {
+  const diagnostic = `${path}: ${reason}`;
+  if (!warnedGuardDiagnostics.has(diagnostic)) {
+    warnedGuardDiagnostics.add(diagnostic);
+    console.warn(`[pi-subagents] Guard configuration issue: ${diagnostic}`);
+  }
+}
+
+function readSettingsFile(path: string): SettingsFileRead {
+  if (!existsSync(path)) return { settings: {} };
+  let text: string;
   try {
-    return sanitize(JSON.parse(readFileSync(path, "utf-8")));
+    text = readFileSync(path, "utf-8");
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    console.warn(`[pi-subagents] Ignoring malformed settings at ${path}: ${reason}`);
-    return {};
+    const diagnostic = `settings file unreadable: ${path} (${reason})`;
+    warnGuardDiagnostic(path, diagnostic);
+    return { settings: {}, guardExpectedDiagnostic: diagnostic };
   }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    const mentionsExpected = text.includes("guardExpected");
+    const mentionsRegistrant = text.includes("guardRegistrant");
+    if (!mentionsExpected && !mentionsRegistrant) {
+      console.warn(`[pi-subagents] Ignoring malformed settings at ${path}: ${reason}`);
+      return { settings: {} };
+    }
+
+    const namedKeys = [mentionsExpected && "guardExpected", mentionsRegistrant && "guardRegistrant"].filter(Boolean).join(" and ");
+    const diagnostic = `settings file is malformed and contains ${namedKeys} (${reason}); treating guarded work as required until fixed`;
+    warnGuardDiagnostic(path, diagnostic);
+    return {
+      settings: { guardExpected: true },
+      ...(mentionsExpected ? { guardExpectedDiagnostic: `${path}: ${diagnostic}` } : {}),
+      ...(mentionsRegistrant ? { guardRegistrantDiagnostic: `guard-registrant-unconfigured: ${path}: ${diagnostic}` } : {}),
+    };
+  }
+
+  const settings = sanitize(parsed);
+  if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const record = parsed as Record<string, unknown>;
+    const invalidSettings = { ...settings };
+    let invalidGuardExpectedDiagnostic: string | undefined;
+    let invalidGuardRegistrantDiagnostic: string | undefined;
+    if (Object.hasOwn(record, "guardExpected") && typeof record.guardExpected !== "boolean") {
+      const value = record.guardExpected;
+      const diagnostic = `guardExpected must be a boolean, received ${value === null ? "null" : typeof value}; treating guarded work as required until fixed`;
+      warnGuardDiagnostic(path, diagnostic);
+      invalidSettings.guardExpected = true;
+      invalidGuardExpectedDiagnostic = `${path}: ${diagnostic}`;
+    }
+    if (Object.hasOwn(record, "guardRegistrant") && typeof record.guardRegistrant !== "string") {
+      const diagnostic = `guardRegistrant must be a string, received ${record.guardRegistrant === null ? "null" : typeof record.guardRegistrant}`;
+      warnGuardDiagnostic(path, diagnostic);
+      invalidSettings.guardRegistrant = "";
+      invalidGuardRegistrantDiagnostic = `guard-registrant-unconfigured: ${path}: ${diagnostic}`;
+    }
+    if (invalidGuardExpectedDiagnostic || invalidGuardRegistrantDiagnostic) {
+      return {
+        settings: invalidSettings,
+        ...(invalidGuardExpectedDiagnostic ? { guardExpectedDiagnostic: invalidGuardExpectedDiagnostic } : {}),
+        ...(invalidGuardRegistrantDiagnostic ? { guardRegistrantDiagnostic: invalidGuardRegistrantDiagnostic } : {}),
+      };
+    }
+  }
+  return { settings };
 }
 
 /** Load merged settings: global provides defaults, project overrides. */
 export function loadSettings(cwd: string = process.cwd()): SubagentsSettings {
-  return { ...readSettingsFile(globalPath()), ...readSettingsFile(projectPath(cwd)) };
+  const global = readSettingsFile(globalPath());
+  const project = readSettingsFile(projectPath(cwd));
+  const merged = { ...global.settings, ...project.settings };
+  // Guard enablement is monotonic across config layers; a project can require
+  // the bridge, but cannot weaken a global requirement by writing false.
+  if (global.settings.guardExpected === true || project.settings.guardExpected === true) merged.guardExpected = true;
+
+  const globalRegistrant = typeof global.settings.guardRegistrant === "string" ? global.settings.guardRegistrant.trim() : "";
+  const projectRegistrant = typeof project.settings.guardRegistrant === "string" ? project.settings.guardRegistrant.trim() : "";
+  const registrantDiagnostics = [global.guardRegistrantDiagnostic, project.guardRegistrantDiagnostic].filter(Boolean);
+  if (globalRegistrant && projectRegistrant && globalRegistrant !== projectRegistrant) {
+    registrantDiagnostics.push("guard-registrant-conflict: global and project guardRegistrant values differ.");
+    merged.guardRegistrant = undefined;
+  } else {
+    merged.guardRegistrant = projectRegistrant || globalRegistrant || undefined;
+    if (registrantDiagnostics.length > 0) merged.guardRegistrant = undefined;
+  }
+  guardExpectedDiagnostic = [global.guardExpectedDiagnostic, project.guardExpectedDiagnostic].filter(Boolean).join("; ") || undefined;
+  guardRegistrantDiagnostic = registrantDiagnostics.join("; ") || undefined;
+  return merged;
+}
+
+/** Diagnostic for malformed guardExpected settings, exposed by the advertisement. */
+export function getGuardExpectedDiagnostic(): string | undefined {
+  return guardExpectedDiagnostic;
+}
+
+/** Diagnostic for guardRegistrant configuration, exposed by the advertisement. */
+export function getGuardRegistrantDiagnostic(): string | undefined {
+  return guardRegistrantDiagnostic;
 }
 
 /**
@@ -502,7 +610,32 @@ export function saveSettings(s: SubagentsSettings, cwd: string = process.cwd()):
   const path = projectPath(cwd);
   try {
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, JSON.stringify(s, null, 2), "utf-8");
+    const persisted: Record<string, unknown> = { ...s };
+    // Configuration-only guard fields preserve only keys owned by this project
+    // file; merged global/programmatic values are never materialized here.
+    delete persisted.guardExpected;
+    delete persisted.guardRegistrant;
+    if (existsSync(path)) {
+      try {
+        const text = readFileSync(path, "utf-8");
+        const existing: unknown = JSON.parse(text);
+        if (existing !== null && typeof existing === "object" && !Array.isArray(existing)) {
+          const record = existing as Record<string, unknown>;
+          if (Object.hasOwn(record, "guardExpected")) persisted.guardExpected = record.guardExpected;
+          if (Object.hasOwn(record, "guardRegistrant")) persisted.guardRegistrant = record.guardRegistrant;
+        }
+      } catch {
+        // Retain configuration-only guard keys named by malformed project JSON.
+        try {
+          const text = readFileSync(path, "utf-8");
+          if (text.includes("guardExpected") || text.includes("guardRegistrant")) persisted.guardExpected = true;
+          if (text.includes("guardRegistrant")) persisted.guardRegistrant = "";
+        } catch {
+          // An unreadable file contains no safely preservable guard opt-in; do not infer one.
+        }
+      }
+    }
+    writeFileSync(path, JSON.stringify(persisted, null, 2), "utf-8");
     return true;
   } catch {
     return false;
@@ -537,6 +670,8 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.showModel === "boolean") appliers.setShowModel(s.showModel);
   if (s.viewerMarkdown) appliers.setViewerMarkdown(s.viewerMarkdown);
   if (typeof s.workflowsEnabled === "boolean") appliers.setWorkflowsEnabled(s.workflowsEnabled);
+  if (typeof s.guardExpected === "boolean") appliers.setGuardExpected?.(s.guardExpected);
+  appliers.setGuardRegistrant?.(s.guardRegistrant);
 }
 
 /**

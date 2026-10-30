@@ -250,6 +250,7 @@ export class SubagentScheduler {
       if (!dispatch.ok) throw new Error(dispatch.message);
       agentId = manager.spawn(pi, ctx, dispatch.type, job.prompt, {
         description: job.description,
+        guardEntryPath: "scheduled-task.fire",
         isBackground: true,
         bypassQueue: true,
         model: resolvedModel,

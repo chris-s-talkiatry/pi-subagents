@@ -20,6 +20,7 @@ import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { GuardBridgeHost, type GuardBridgeRegistration, type GuardBridgeRejectionCode, type GuardEntryPathId, type GuardIngressEvidence, type GuardIngressInput } from "./guard-bridge.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
 import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
@@ -168,6 +169,10 @@ interface SpawnArgs {
 
 interface SpawnOptions {
   description: string;
+  /** Diagnostic entry point; defaults to the manager method. */
+  guardEntryPath?: GuardEntryPathId;
+  /** Retained bridge reference forwarded to child construction options. */
+  guardBridgeRegistration?: GuardBridgeRegistration;
   /**
    * Optional memorable name for this instance, becoming a second handle
    * (`@auth-audit`) alongside the type-derived one. Slugged, not validated —
@@ -304,6 +309,10 @@ interface SpawnOptions {
 }
 
 interface ResumeOptions {
+  /** Diagnostic entry point; defaults to the manager method. */
+  guardEntryPath?: GuardEntryPathId;
+  /** Retained bridge reference forwarded to child construction options. */
+  guardBridgeRegistration?: GuardBridgeRegistration;
   /**
    * Run the resumed turn detached in the background: return immediately with
    * the record still "running" (or "queued" at the concurrency limit) and
@@ -361,6 +370,59 @@ async function shutdownChildSession(session: AgentSession | undefined): Promise<
 }
 
 export class AgentManager {
+  /** Direct-reference registration state shared by manager entry paths. */
+  readonly guardBridgeHost = new GuardBridgeHost();
+
+  registerGuard(registration: unknown): { compatible: boolean; registrationRejected?: string; reasonCode?: GuardBridgeRejectionCode } {
+    return this.guardBridgeHost.register(registration);
+  }
+
+  rejectGuardRegistration(reason: string): { compatible: false; registrationRejected: string; reasonCode?: GuardBridgeRejectionCode } {
+    return this.guardBridgeHost.rejectRegistration(reason);
+  }
+
+  unregisterGuard(): void {
+    this.guardBridgeHost.unregister();
+  }
+
+  setGuardExpected(expected: boolean): void {
+    this.guardBridgeHost.setGuardExpected(expected);
+  }
+
+  setGuardExpectedDiagnostic(diagnostic: string | undefined): void {
+    this.guardBridgeHost.setGuardExpectedDiagnostic(diagnostic);
+  }
+
+  setGuardRegistrant(registrant: string | undefined): void {
+    this.guardBridgeHost.setGuardRegistrant(registrant);
+  }
+
+  setGuardRegistrantDiagnostic(diagnostic: string | undefined): void {
+    this.guardBridgeHost.setGuardRegistrantDiagnostic(diagnostic);
+  }
+
+
+  assertGuard(entryPath: GuardEntryPathId): GuardBridgeRegistration | undefined {
+    return this.guardBridgeHost.assertGuard(entryPath);
+  }
+
+  captureIngress(input: GuardIngressInput): GuardIngressEvidence | Promise<GuardIngressEvidence> | undefined {
+    const capture = this.guardBridgeHost.captureIngress(input);
+    if (capture && typeof (capture as Promise<GuardIngressEvidence>).then === "function") {
+      return Promise.resolve(capture).then(evidence => {
+        this.guardBridgeHost.assertIngressCaptureActive(evidence, input.entryPath);
+        return evidence;
+      });
+    }
+    this.guardBridgeHost.assertIngressCaptureActive(capture as GuardIngressEvidence | undefined, input.entryPath);
+    return capture;
+  }
+
+  assertIngressCaptureActive(evidence: GuardIngressEvidence | undefined, entryPath: GuardEntryPathId): void {
+    this.guardBridgeHost.assertIngressCaptureActive(evidence, entryPath);
+  }
+
+
   private agents = new Map<string, AgentRecord>();
   private cleanupInterval: ReturnType<typeof setInterval>;
   private onComplete?: OnAgentComplete;
@@ -493,6 +555,7 @@ export class AgentManager {
     prompt: string,
     options: SpawnOptions,
   ): string {
+    const registration = this.assertGuard(options.guardEntryPath ?? "agent-manager.spawn");
     // Validate before the queue branch — a queued spawn should fail at the
     // call, not minutes later at drain. Throw (not warn): programmatic callers
     // can fix and retry; the RPC layer converts throws into error envelopes.
@@ -550,7 +613,10 @@ export class AgentManager {
       record.alias = assignHandle(handleBase(options.name), this.takenHandles());
     }
 
-    const args: SpawnArgs = { pi, ctx, type, prompt, options };
+    const spawnOptions = registration !== undefined
+      ? { ...options, guardBridgeRegistration: registration }
+      : options;
+    const args: SpawnArgs = { pi, ctx, type, prompt, options: spawnOptions };
 
     const pool = this.poolFor(record);
     if (pool !== undefined && !options.bypassQueue && !this.poolHasRoom(pool)) {
@@ -666,9 +732,16 @@ export class AgentManager {
   private async startAgent(
     id: string,
     record: AgentRecord,
-    { pi, ctx, type, prompt, options }: SpawnArgs,
+    args: SpawnArgs,
   ) {
-    // Re-validate a caller-supplied cwd: queued spawns can start minutes after
+    const { pi, ctx, type, prompt } = args;
+    // Queue wait can outlive the guard registration captured by spawn(). Re-check
+    // at drain time before touching the record or creating a child session.
+    const registration = this.assertGuard(args.options.guardEntryPath ?? "agent-manager.spawn");
+    const options = { ...args.options };
+    delete options.guardBridgeRegistration;
+    if (registration !== undefined) options.guardBridgeRegistration = registration;
+
     // spawn()'s check, and the directory may be gone by then (TOCTOU). Same
     // curated errors; drainQueue parks a throw on the record as an error.
     assertValidSpawnCwd(options.cwd);
@@ -768,6 +841,9 @@ export class AgentManager {
       thinkingLevel: options.thinkingLevel,
       structuredOutput: options.structuredOutput,
       resumeSessionFile: options.resumeSessionFile,
+      ...(options.guardBridgeRegistration !== undefined ? { guardBridgeRegistration: options.guardBridgeRegistration } : {}),
+      guardBridgeHost: this.guardBridgeHost,
+      guardExpected: this.guardBridgeHost.guardExpected,
       nested: options.parentAgentId !== undefined,
       workflow: options.workflowId !== undefined,
       // Worktree wins for the working dir (the agent must run in the copy —
@@ -804,6 +880,8 @@ export class AgentManager {
         maxSubagentDepth: record.maxSubagentDepth,
       },
       onSessionCreated: (session) => {
+        if (record.pendingSteers?.length) this.assertGuard("agent-manager.pending-steer");
+
         record.session = session;
         // Capture now, while the session object exists: after eviction this
         // path is the only thing that can reopen the conversation, and an
@@ -1058,6 +1136,8 @@ export class AgentManager {
     options: Omit<SpawnOptions, "isBackground">,
     onSpawned?: (id: string) => void,
   ): Promise<{ id: string; record: AgentRecord }> {
+    const guardEntryPath = options.guardEntryPath ?? "agent-manager.spawn-and-wait";
+    const registration = this.assertGuard(guardEntryPath);
     // `blocking` is what maxConcurrentForeground bounds, and this is its only
     // source. onSpawned rides on the options rather than on a field of this
     // manager: a queued spawn starts at drain time, long after any install/
@@ -1065,6 +1145,8 @@ export class AgentManager {
     // fires after an await (worktree creation) even on the immediate path.
     const id = this.spawn(pi, ctx, type, prompt, {
       ...options,
+      ...(options.guardEntryPath !== undefined ? { guardEntryPath } : {}),
+      ...(registration !== undefined ? { guardBridgeRegistration: registration } : {}),
       isBackground: false,
       blocking: true,
       onSpawned,
@@ -1110,6 +1192,10 @@ export class AgentManager {
     signal?: AbortSignal,
     options?: ResumeOptions,
   ): Promise<AgentRecord | undefined> {
+    const registration = this.assertGuard(options?.guardEntryPath ?? "agent-manager.resume");
+    const resumeOptions = registration !== undefined
+      ? { ...options, guardBridgeRegistration: registration }
+      : options;
     const record = this.agents.get(id);
     if (!record?.session) return undefined;
 
@@ -1138,7 +1224,7 @@ export class AgentManager {
       record.completedAt = undefined;
       record.status = "queued";
 
-      const start = () => this.startResume(id, record, prompt, signal, options);
+      const start = () => this.startResume(id, record, prompt, signal, resumeOptions ?? {});
       if (occupiesPoolSlot(record) && !this.poolHasRoom("background")) {
         // At the concurrency limit — queue it, drains when a slot frees. A
         // detached resume has no inline caller, hence nothing to release. The
@@ -1174,26 +1260,31 @@ export class AgentManager {
     record.error = undefined;
 
     try {
-      const { text, failure } = await resumeAgent(record.session, prompt, {
+      const { text, failure, aborted } = await resumeAgent(record.session, prompt, {
         onToolActivity: (activity) => {
           if (activity.type === "end") record.toolUses++;
-          options?.onToolActivity?.(activity);
+          resumeOptions?.onToolActivity?.(activity);
         },
         onAssistantUsage: (usage) => {
           addUsage(record.lifetimeUsage, usage);
           this.onUsage?.(record, usage);
-          options?.onAssistantUsage?.(usage);
+          resumeOptions?.onAssistantUsage?.(usage);
         },
         onCompaction: (info) => {
           record.compactionCount++;
           this.onCompact?.(record, info);
-          options?.onCompaction?.(info);
+          resumeOptions?.onCompaction?.(info);
         },
         signal,
+        ...(registration !== undefined ? { guardBridgeRegistration: registration } : {}),
+        guardBridgeHost: this.guardBridgeHost,
+        guardExpected: this.guardBridgeHost.guardExpected,
       });
       // Same contract as the spawn path (#144): a failed final turn is an
       // error, not a completion — but the resumed text stays available.
-      record.status = failure ? "error" : "completed";
+      if ((record.status as string) !== "stopped") {
+        record.status = aborted ? "aborted" : failure ? "error" : "completed";
+      }
       if (failure) record.error = failure;
       record.result = text;
       record.completedAt = Date.now();
@@ -1222,9 +1313,16 @@ export class AgentManager {
     record: AgentRecord,
     prompt: string,
     parentSignal: AbortSignal | undefined,
-    options: ResumeOptions,
+    requestedOptions: ResumeOptions,
   ) {
+    // A queued resume can outlive the registration captured when it was queued.
+    // Re-check before changing the record or invoking the existing session.
+    const registration = this.assertGuard(requestedOptions.guardEntryPath ?? "agent-manager.resume");
+    const options = { ...requestedOptions };
+    delete options.guardBridgeRegistration;
+    if (registration !== undefined) options.guardBridgeRegistration = registration;
     if (!record.session) return;
+
 
     record.status = "running";
     record.startedAt = Date.now();
@@ -1281,13 +1379,16 @@ export class AgentManager {
         options.onCompaction?.(info);
       },
       signal: abortController.signal,
+      ...(options.guardBridgeRegistration !== undefined ? { guardBridgeRegistration: options.guardBridgeRegistration } : {}),
+      guardBridgeHost: this.guardBridgeHost,
+      guardExpected: this.guardBridgeHost.guardExpected,
     })
-      .then(({ text, failure }) => {
+      .then(({ text, failure, aborted }) => {
         // Don't overwrite status if externally stopped via abort().
         if (record.status !== "stopped") {
           // Same contract as the spawn path (#144): a failed final turn is an
           // error, not a completion — but the resumed text stays available.
-          record.status = failure ? "error" : "completed";
+          record.status = aborted ? "aborted" : failure ? "error" : "completed";
           if (failure) record.error = failure;
         }
         record.result = text;
@@ -1317,6 +1418,7 @@ export class AgentManager {
    * (unknown id, or no longer running/queued).
    */
   steer(id: string, message: string): boolean {
+    this.assertGuard("agent-manager.steer");
     const record = this.agents.get(id);
     if (!record) return false;
     if (record.status !== "running" && record.status !== "queued") return false;
