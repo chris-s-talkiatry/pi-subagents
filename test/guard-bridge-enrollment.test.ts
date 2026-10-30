@@ -253,6 +253,205 @@ describe("preloaded child resource enrollment", () => {
   });
 
 
+  it.each(["unregister", "replace"] as const)("rejects the entire spawn enrollment batch when registration changes during the final callback (%s)", async (change) => {
+    const host = new GuardBridgeHost(true, "scope-guard");
+    let releaseEnrollment!: () => void;
+    let markStarted!: () => void;
+    const enrollmentGate = new Promise<void>((resolve) => { releaseEnrollment = resolve; });
+    const enrollmentStarted = new Promise<void>((resolve) => { markStarted = resolve; });
+    const replacementEnroll = vi.fn();
+    host.register(registration(async (value) => {
+      events.push(`enroll:${value.kind}`);
+      if (value.kind === "agent-definition") {
+        markStarted();
+        await enrollmentGate;
+      }
+    }));
+
+    const run = runAgent(ctx(), "scope-child", "child task", {
+      pi: makePi().pi,
+      guardBridgeHost: host,
+      guardExpected: true,
+    });
+    await enrollmentStarted;
+    host.unregister();
+    if (change === "replace") host.register(registration(replacementEnroll));
+    releaseEnrollment();
+
+    await expect(run).rejects.toMatchObject({ name: "GuardBridgeRejection", reasonCode: "guard-missing", entryPath: "agent-manager.spawn" });
+    expect(events).toEqual(["enroll:skill", "enroll:agent-definition"]);
+    expect(replacementEnroll).not.toHaveBeenCalled();
+    expect(sessionMocks.createAgentSession).not.toHaveBeenCalled();
+    expect(session.prompt).not.toHaveBeenCalled();
+  });
+
+  it("does not split an enrollment batch across registration snapshots", async () => {
+    const host = new GuardBridgeHost(true, "scope-guard");
+    let releaseEnrollment!: () => void;
+    let markStarted!: () => void;
+    const enrollmentGate = new Promise<void>((resolve) => { releaseEnrollment = resolve; });
+    const enrollmentStarted = new Promise<void>((resolve) => { markStarted = resolve; });
+    const replacementEnroll = vi.fn();
+    host.register(registration(async (value) => {
+      events.push(`enroll:${value.kind}`);
+      if (value.kind === "skill") {
+        markStarted();
+        await enrollmentGate;
+      }
+    }));
+
+    const run = runAgent(ctx(), "scope-child", "child task", {
+      pi: makePi().pi,
+      guardBridgeHost: host,
+      guardExpected: true,
+    });
+    await enrollmentStarted;
+    host.unregister();
+    host.register(registration(replacementEnroll));
+    releaseEnrollment();
+
+    await expect(run).rejects.toMatchObject({ name: "GuardBridgeRejection", reasonCode: "guard-missing", entryPath: "agent-manager.spawn" });
+    expect(events).toEqual(["enroll:skill"]);
+    expect(replacementEnroll).not.toHaveBeenCalled();
+    expect(sessionMocks.createAgentSession).not.toHaveBeenCalled();
+  });
+
+  it.each(["session creation", "extension binding"] as const)("reasserts the same registration before the first prompt after %s", async (waitPoint) => {
+    const host = new GuardBridgeHost(true, "scope-guard");
+    host.register(registration(() => {}));
+    if (waitPoint === "session creation") {
+      sessionMocks.createAgentSession.mockImplementationOnce(async () => {
+        events.push("create-session");
+        host.unregister();
+        return { session };
+      });
+    } else {
+      session.bindExtensions.mockImplementationOnce(async () => {
+        events.push("bind-extensions");
+        host.unregister();
+      });
+    }
+
+    await expect(runAgent(ctx(), "scope-child", "child task", {
+      pi: makePi().pi,
+      guardBridgeHost: host,
+      guardExpected: true,
+    })).rejects.toMatchObject({ name: "GuardBridgeRejection", reasonCode: "guard-missing", entryPath: "agent-manager.spawn" });
+    expect(session.prompt).not.toHaveBeenCalled();
+    expect(session.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not prompt after an abort while resource enrollment is pending", async () => {
+    const host = new GuardBridgeHost(true, "scope-guard");
+    let releaseEnrollment!: () => void;
+    let markStarted!: () => void;
+    const enrollmentGate = new Promise<void>((resolve) => { releaseEnrollment = resolve; });
+    const enrollmentStarted = new Promise<void>((resolve) => { markStarted = resolve; });
+    host.register(registration(async (value) => {
+      if (value.kind === "skill") {
+        markStarted();
+        await enrollmentGate;
+      }
+    }));
+    const controller = new AbortController();
+    const run = runAgent(ctx(), "scope-child", "child task", {
+      pi: makePi().pi,
+      guardBridgeHost: host,
+      guardExpected: true,
+      signal: controller.signal,
+    });
+    await enrollmentStarted;
+    controller.abort();
+    releaseEnrollment();
+
+    await expect(run).resolves.toMatchObject({ aborted: true, responseText: "" });
+    expect(sessionMocks.createAgentSession).not.toHaveBeenCalled();
+    expect(session.prompt).not.toHaveBeenCalled();
+  });
+
+  it.each(["unregister", "replace"] as const)("does not resume after the enrollment snapshot changes (%s)", async (change) => {
+    const host = new GuardBridgeHost(false);
+    await runAgent(ctx(), "scope-child", "initial task", {
+      pi: makePi().pi,
+      guardBridgeHost: host,
+      guardExpected: false,
+    });
+    const promptsBefore = session.prompt.mock.calls.length;
+    let releaseEnrollment!: () => void;
+    let markStarted!: () => void;
+    const enrollmentGate = new Promise<void>((resolve) => { releaseEnrollment = resolve; });
+    const enrollmentStarted = new Promise<void>((resolve) => { markStarted = resolve; });
+    const replacementEnroll = vi.fn();
+    host.register(registration(async (value) => {
+      if (value.kind === "agent-definition") {
+        markStarted();
+        await enrollmentGate;
+      }
+    }));
+
+    const resume = resumeAgent(session, "resume task", { guardBridgeHost: host, guardExpected: false });
+    await enrollmentStarted;
+    host.unregister();
+    if (change === "replace") host.register(registration(replacementEnroll));
+    releaseEnrollment();
+
+    await expect(resume).rejects.toMatchObject({ name: "GuardBridgeRejection", reasonCode: "guard-missing", entryPath: "agent-manager.resume" });
+    expect(session.prompt).toHaveBeenCalledTimes(promptsBefore);
+    expect(replacementEnroll).not.toHaveBeenCalled();
+  });
+
+  it("reasserts the same registration on resume immediately before prompting", async () => {
+    const host = new GuardBridgeHost(true, "scope-guard");
+    host.register(registration(() => {}));
+    await runAgent(ctx(), "scope-child", "initial task", {
+      pi: makePi().pi,
+      guardBridgeHost: host,
+      guardExpected: true,
+    });
+    const promptsBefore = session.prompt.mock.calls.length;
+    session.subscribe.mockImplementationOnce(() => {
+      host.unregister();
+      return () => {};
+    });
+
+    await expect(resumeAgent(session, "resume task", { guardBridgeHost: host, guardExpected: true }))
+      .rejects.toMatchObject({ name: "GuardBridgeRejection", reasonCode: "guard-missing", entryPath: "agent-manager.resume" });
+    expect(session.prompt).toHaveBeenCalledTimes(promptsBefore);
+  });
+
+  it("returns an aborted background-resume outcome after pending enrollment without dispatch", async () => {
+    const host = new GuardBridgeHost(false);
+    await runAgent(ctx(), "scope-child", "initial task", {
+      pi: makePi().pi,
+      guardBridgeHost: host,
+      guardExpected: false,
+    });
+    const promptsBefore = session.prompt.mock.calls.length;
+    let releaseEnrollment!: () => void;
+    let markStarted!: () => void;
+    const enrollmentGate = new Promise<void>((resolve) => { releaseEnrollment = resolve; });
+    const enrollmentStarted = new Promise<void>((resolve) => { markStarted = resolve; });
+    host.register(registration(async (value) => {
+      if (value.kind === "agent-definition") {
+        markStarted();
+        await enrollmentGate;
+      }
+    }));
+    const controller = new AbortController();
+    const resume = resumeAgent(session, "resume task", {
+      guardBridgeHost: host,
+      guardExpected: false,
+      signal: controller.signal,
+    });
+    await enrollmentStarted;
+    controller.abort();
+    releaseEnrollment();
+
+    await expect(resume).resolves.toMatchObject({ text: "", aborted: true });
+    expect(session.prompt).toHaveBeenCalledTimes(promptsBefore);
+    expect(session.abort).not.toHaveBeenCalled();
+  });
+
   it("fails closed on resume enrollment rejection before prompting", async () => {
     const host = new GuardBridgeHost(false);
     await runAgent(ctx(), "scope-child", "child task", {

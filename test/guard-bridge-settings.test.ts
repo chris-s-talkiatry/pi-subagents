@@ -1,9 +1,9 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GuardBridgeHost, getGuardBridgeAdvertisement } from "../src/guard-bridge.js";
-import { getGuardExpectedDiagnostic, getGuardRegistrantDiagnostic, loadSettings } from "../src/settings.js";
+import { getGuardExpectedDiagnostic, getGuardRegistrantDiagnostic, loadSettings, saveSettings } from "../src/settings.js";
 
 describe("guardExpected configuration fails closed when malformed", () => {
   let globalDir: string;
@@ -147,6 +147,31 @@ describe("guardExpected configuration fails closed when malformed", () => {
     writeProject('{ broken "guardRegistrant"');
     expect(loadSettings(projectDir).guardExpected).toBe(true);
     expect(getGuardRegistrantDiagnostic()).toContain("guard-registrant-unconfigured");
+  });
+
+  it("validates an invalid registrant even when guardExpected is also malformed", () => {
+    writeGlobal('{"guardRegistrant":"global-guard"}');
+    writeProject('{"guardExpected":"true","guardRegistrant":null}');
+
+    const settings = loadSettings(projectDir);
+    expect(settings.guardExpected).toBe(true);
+    expect(settings.guardRegistrant).toBeUndefined();
+    expect(getGuardExpectedDiagnostic()).toContain("guardExpected must be a boolean");
+    expect(getGuardRegistrantDiagnostic()).toContain("guardRegistrant must be a string");
+  });
+
+  it("persists fail-closed state when malformed JSON mentions only guardRegistrant", () => {
+    writeProject('{ broken "guardRegistrant"');
+    const loaded = loadSettings(projectDir);
+    expect(loaded.guardExpected).toBe(true);
+
+    expect(saveSettings({ ...loaded, maxConcurrent: 7 }, projectDir)).toBe(true);
+    const persisted = JSON.parse(readFileSync(join(projectDir, ".pi", "subagents.json"), "utf-8"));
+    expect(persisted).toMatchObject({ maxConcurrent: 7, guardExpected: true, guardRegistrant: "" });
+
+    const reloaded = loadSettings(projectDir);
+    expect(reloaded.guardExpected).toBe(true);
+    expect(reloaded.guardRegistrant).toBeUndefined();
   });
 
 

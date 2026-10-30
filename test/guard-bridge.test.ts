@@ -192,7 +192,7 @@ describe("versioned guard bridge contract", () => {
     expect(host.getRegistration()).toBe(registration);
     expect(Object.getOwnPropertyNames(globalThis)).toEqual(beforeNames);
     expect(Object.getOwnPropertySymbols(globalThis)).toEqual(beforeSymbols);
-    expect(Object.getOwnPropertyNames(host)).toEqual(["expected", "registration", "registrationSnapshot", "registrationRejected", "registrationRejectedReasonCode", "registrationRejectionHistory", "guardExpectedDiagnostic", "guardRegistrant", "guardRegistrantDiagnostic"]);
+    expect(Object.getOwnPropertyNames(host)).toEqual(["expected", "registration", "registrationSnapshot", "ingressSnapshots", "registrationRejected", "registrationRejectedReasonCode", "registrationRejectionHistory", "guardExpectedDiagnostic", "guardRegistrant", "guardRegistrantDiagnostic"]);
     expect(Object.getOwnPropertyNames(registration)).toEqual(["registrant", "protocolVersion", "callbacks"]);
     expect(JSON.stringify(host)).not.toContain("identical prompt");
   });

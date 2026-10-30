@@ -111,6 +111,7 @@ async function enrollResolvedResources(
   guardExpected: boolean,
   resources: readonly GuardResourceEnrollment[],
   enrolledByRegistration: WeakMap<object, Set<string>>,
+  registrationSnapshot: object | undefined,
   entryPath: GuardEntryPathId,
 ): Promise<void> {
   if (!host) {
@@ -120,19 +121,22 @@ async function enrollResolvedResources(
     }
     return;
   }
+  host.assertRegistrationSnapshotActive(registrationSnapshot, entryPath);
   for (const resource of resources) {
     const key = resourceKey(resource);
-    const registrationIdentity = host.getResourceEnrollmentSnapshotIdentity();
-    if (registrationIdentity && enrolledByRegistration.get(registrationIdentity)?.has(key)) continue;
-    if (await host.enrollResource(resource, entryPath) && registrationIdentity) {
-      let enrolled = enrolledByRegistration.get(registrationIdentity);
+    if (registrationSnapshot && enrolledByRegistration.get(registrationSnapshot)?.has(key)) continue;
+    if (await host.enrollResourceForSnapshot(resource, entryPath, registrationSnapshot) && registrationSnapshot) {
+      let enrolled = enrolledByRegistration.get(registrationSnapshot);
       if (!enrolled) {
         enrolled = new Set<string>();
-        enrolledByRegistration.set(registrationIdentity, enrolled);
+        enrolledByRegistration.set(registrationSnapshot, enrolled);
       }
       enrolled.add(key);
     }
   }
+  // The whole preload batch belongs to its initial snapshot. Do not return a
+  // partially enrolled batch if unregister/re-register raced its final callback.
+  host.assertRegistrationSnapshotActive(registrationSnapshot, entryPath);
 }
 
 /**
@@ -588,7 +592,7 @@ export interface RunOptions {
 
 export interface RunResult {
   responseText: string;
-  session: AgentSession;
+  session?: AgentSession;
   /** True if the agent was hard-aborted (max_turns + grace exceeded). */
   aborted: boolean;
   /** True if the agent was steered to wrap up (hit soft turn limit) but finished in time. */
@@ -690,6 +694,10 @@ function finalTurnError(session: AgentSession, startIndex = 0): string | undefin
 function forwardAbortSignal(session: AgentSession, signal?: AbortSignal): () => void {
   if (!signal) return () => {};
   const onAbort = () => session.abort();
+  if (signal.aborted) {
+    onAbort();
+    return () => {};
+  }
   signal.addEventListener("abort", onAbort, { once: true });
   return () => signal.removeEventListener("abort", onAbort);
 }
@@ -707,6 +715,13 @@ export async function runAgent(
   prompt: string,
   options: RunOptions,
 ): Promise<RunResult> {
+  let guardRegistrationSnapshot = options.guardBridgeHost?.getResourceEnrollmentSnapshotIdentity();
+  if (options.guardBridgeHost) {
+    options.guardBridgeHost.assertRegistrationSnapshotActive(guardRegistrationSnapshot, "agent-manager.spawn");
+  } else if (options.guardExpected) {
+    throw new GuardBridgeRejection("guard-missing", "agent-manager.spawn",
+      "guard-missing: guarded work is unavailable at agent-manager.spawn; no guard bridge host is present in runner options for resource enrollment.");
+  }
   const config = getConfig(type);
   const agentConfig = getAgentConfig(type);
 
@@ -806,8 +821,12 @@ export async function runAgent(
       options.guardExpected === true,
       resources,
       enrolledByRegistration,
+      guardRegistrationSnapshot,
       "agent-manager.spawn",
     );
+  }
+  if (options.signal?.aborted) {
+    return { responseText: "", aborted: true, steered: false };
   }
 
   // When skills is string[], we've already preloaded them into the prompt.
@@ -1214,10 +1233,9 @@ export async function runAgent(
             entryPath: "agent-runner.turn-limit-steer",
           });
           if (capture && typeof (capture as Promise<unknown>).then === "function") {
-            const registration = options.guardBridgeHost?.getRegistration?.();
+            const registrationSnapshot = options.guardBridgeHost?.getResourceEnrollmentSnapshotIdentity();
             void (capture as Promise<unknown>).then(() => {
-              if (options.guardExpected) options.guardBridgeHost?.assertGuard("agent-runner.turn-limit-steer");
-              else if (registration && options.guardBridgeHost?.getRegistration?.() !== registration) return;
+              options.guardBridgeHost?.assertRegistrationSnapshotActive(registrationSnapshot, "agent-runner.turn-limit-steer");
               return session.steer(message);
             }).catch((error) => {
               options.guardBridgeHost?.recordIngressContinuationFailure("agent-runner.turn-limit-steer", error);
@@ -1276,6 +1294,27 @@ export async function runAgent(
   const startLen = session.messages.length;
   let structuredRetried = false;
   try {
+    const activeSnapshot = options.guardBridgeHost?.getResourceEnrollmentSnapshotIdentity();
+    // If no registration existed at startup but guarded mode became required
+    // while the session was being prepared, enroll the complete batch under
+    // that first snapshot before prompting. A non-empty prior snapshot is never
+    // silently replaced; its batch was either accepted or rejected above.
+    if (guardRegistrationSnapshot === undefined && activeSnapshot !== undefined && options.guardBridgeHost?.guardExpected) {
+      await enrollResolvedResources(
+        options.guardBridgeHost,
+        true,
+        resources,
+        enrolledByRegistration,
+        activeSnapshot,
+        "agent-manager.spawn",
+      );
+      guardRegistrationSnapshot = activeSnapshot;
+    }
+    options.guardBridgeHost?.assertRegistrationSnapshotActive(guardRegistrationSnapshot, "agent-manager.spawn");
+    if (options.signal?.aborted) {
+      try { session.dispose?.(); } catch { /* preserve aborted outcome */ }
+      return { responseText: "", session, aborted: true, steered: false };
+    }
     await session.prompt(effectivePrompt);
 
     // One more prompt when a schema was asked for and nothing usable came back
@@ -1288,6 +1327,9 @@ export async function runAgent(
       structuredRetried = true;
       await session.prompt(structuredRetryPrompt(structuredCapture));
     }
+  } catch (error) {
+    try { session.dispose?.(); } catch { /* preserve the guard/abort failure */ }
+    throw error;
   } finally {
     unsubTurns();
     collector.unsubscribe();
@@ -1330,7 +1372,14 @@ export async function resumeAgent(
     guardBridgeHost?: GuardBridgeHost;
     guardExpected?: boolean;
   } = {},
-): Promise<{ text: string; failure?: string }> {
+): Promise<{ text: string; failure?: string; aborted?: boolean }> {
+  const guardRegistrationSnapshot = options.guardBridgeHost?.getResourceEnrollmentSnapshotIdentity();
+  if (options.guardBridgeHost) {
+    options.guardBridgeHost.assertRegistrationSnapshotActive(guardRegistrationSnapshot, "agent-manager.resume");
+  } else if (options.guardExpected) {
+    throw new GuardBridgeRejection("guard-missing", "agent-manager.resume",
+      "guard-missing: guarded work is unavailable at agent-manager.resume; no guard bridge host is present for resource enrollment.");
+  }
   const resourceState = sessionResourceEnrollments.get(session);
   if (resourceState) {
     await enrollResolvedResources(
@@ -1338,9 +1387,11 @@ export async function resumeAgent(
       options.guardExpected === true,
       resourceState.resources,
       resourceState.enrolledByRegistration,
+      guardRegistrationSnapshot,
       "agent-manager.resume",
     );
   }
+  if (options.signal?.aborted) return { text: "", aborted: true };
 
   // Boundary for the history fallback: the session already holds prior turns,
   // so only assistant text produced by THIS resume prompt counts as its output
@@ -1370,6 +1421,8 @@ export async function resumeAgent(
     : () => {};
 
   try {
+    options.guardBridgeHost?.assertRegistrationSnapshotActive(guardRegistrationSnapshot, "agent-manager.resume");
+    if (options.signal?.aborted) return { text: "", aborted: true };
     await session.prompt(prompt);
   } finally {
     collector.unsubscribe();

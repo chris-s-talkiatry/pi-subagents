@@ -84,6 +84,14 @@ async function registerCapture(current = booted!, capture = createCapture()) {
   return capture;
 }
 
+async function changeRootRegistration(opened: any, change: "unregister" | "replace") {
+  await opened.lifecycle.get("session_before_switch")?.();
+  if (change === "replace") {
+    await opened.lifecycle.get("session_start")?.({}, ctx());
+    opened.pi.events.emit("subagents:guard:register", createCapture().registration);
+  }
+}
+
 function fakeSession(log?: string[]) {
   return {
     messages: [],
@@ -223,6 +231,32 @@ describe("real supported ingress handlers", () => {
     });
     expect(capture.log).toEqual(["capture", "spawn"]);
     expect(spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["unregister", "replace"] as const)("does not run a mention clone after its capture registration changes (%s)", async (change) => {
+    const opened = boot({ agentMentions: "model" });
+    const capture = createCapture();
+    let release!: () => void;
+    let markStarted!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { markStarted = resolve; });
+    capture.registration.callbacks.captureIngress = vi.fn((evidence: any) => {
+      capture.log.push("capture");
+      capture.evidence.push(evidence);
+      if (evidence.entryPath === "mention.input-clone") { markStarted(); return pending; }
+      return undefined;
+    });
+    await registerCapture(opened, capture);
+    const notify = vi.fn();
+    runnerMocks.runMentionClone.mockClear().mockResolvedValue({ spawned: true } as any);
+    const input = opened.lifecycle.get("input")!({ type: "input", text: "@explore guarded clone request", source: "interactive" }, ctx({ ui: { ...ctx().ui, notify } }));
+    await started;
+    await changeRootRegistration(opened, change);
+    release();
+    await expect(input).resolves.toEqual({ action: "continue" });
+    expect(runnerMocks.runMentionClone).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("guard-missing"), "warning");
+    expect(capture.evidence[0]).toMatchObject({ entryPath: "mention.input-clone", rawText: "@explore guarded clone request" });
   });
 
   it("captures clone-mode mentions before starting the model clone", async () => {
@@ -396,6 +430,7 @@ describe("real supported ingress handlers", () => {
       listAgents: () => [seeded.record],
       assertGuard: (entryPath: any) => host.assertGuard(entryPath),
       captureIngress: (input: any) => host.captureIngress(input),
+      assertIngressCaptureActive: (evidence: any, entryPath: any) => host.assertIngressCaptureActive(evidence, entryPath),
       steer,
       abort: vi.fn(() => true),
     };
@@ -461,7 +496,8 @@ describe("real supported ingress handlers", () => {
 
   it("captures nested model steers as delegation, not human input", async () => {
     const opened = boot();
-    const capture = await registerCapture(opened);
+    const capture = createCapture();
+    await registerCapture(opened, capture);
     const nestedManager = new AgentManager();
     nestedManager.registerGuard(capture.registration);
     const parent = seedAgent(nestedManager, opened.pi, "running");
@@ -497,6 +533,39 @@ describe("real supported ingress handlers", () => {
     expect(capture.log.slice(-2)).toEqual(["capture", "steer"]);
   });
 
+  it.each(["unregister", "replace"] as const)("does not dispatch a nested steer captured by a replaced registration (%s)", async (change) => {
+    const opened = boot();
+    const capture = createCapture();
+    const nestedManager = new AgentManager();
+    const parent = seedAgent(nestedManager, opened.pi, "running");
+    const child = seedAgent(nestedManager, opened.pi, "running", parent.id);
+    let release!: () => void;
+    let markStarted!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { markStarted = resolve; });
+    capture.registration.callbacks.captureIngress = vi.fn((evidence: any) => {
+      capture.log.push("capture");
+      capture.evidence.push(evidence);
+      if (evidence.entryPath === "nested-agent.steer") { markStarted(); return pending; }
+      return undefined;
+    });
+    await registerCapture(opened, capture);
+    nestedManager.registerGuard(capture.registration);
+    const tools = createNestedSubagentTools({
+      manager: nestedManager, pi: opened.pi, parentAgentId: parent.id, depth: 1, maxSubagentDepth: 3,
+      allowedSubagents: "all", configCwd: process.cwd(),
+    });
+    const steer = tools.find(tool => tool.name === "steer_subagent")!;
+    const invocation = steer.execute("nested-steer-pending", { agent_id: child.id, message: "pending nested steer" });
+    await started;
+    nestedManager.unregisterGuard();
+    if (change === "replace") nestedManager.registerGuard(createCapture().registration);
+    release();
+    await expect(invocation).rejects.toMatchObject({ name: "GuardBridgeRejection", reasonCode: "guard-missing", entryPath: "nested-agent.steer" });
+    expect(child.session.steer).not.toHaveBeenCalled();
+    expect(capture.evidence[0]).toMatchObject({ entryPath: "nested-agent.steer", rawText: "pending nested steer" });
+  });
+
 });
 
 
@@ -524,6 +593,32 @@ describe("remaining owned ingress paths", () => {
     });
     expect(capture.log).toEqual(["capture", "resume"]);
     expect(resume).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["unregister", "replace"] as const)("does not create a schedule from a capture bound to an inactive registration (%s)", async (change) => {
+    const opened = boot();
+    const capture = createCapture();
+    let release!: () => void;
+    let markStarted!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { markStarted = resolve; });
+    capture.registration.callbacks.captureIngress = vi.fn((evidence: any) => {
+      capture.log.push("capture");
+      capture.evidence.push(evidence);
+      if (evidence.entryPath === "agent-tool.schedule-create") { markStarted(); return pending; }
+      return undefined;
+    });
+    await registerCapture(opened, capture);
+    const addJob = vi.spyOn(SubagentScheduler.prototype, "addJob").mockImplementation(() => ({ id: "never-created", name: "schedule", scheduleType: "once" } as any));
+    const invocation = opened.tools.get("Agent").execute("schedule-pending", {
+      prompt: "pending scheduled prompt", description: "pending schedule", subagent_type: "explore", schedule: "+10m",
+    }, undefined, undefined, ctx());
+    await started;
+    await changeRootRegistration(opened, change);
+    release();
+    await expect(invocation).rejects.toMatchObject({ name: "GuardBridgeRejection", reasonCode: "guard-missing", entryPath: "agent-tool.schedule-create" });
+    expect(addJob).not.toHaveBeenCalled();
+    expect(capture.evidence[0]).toMatchObject({ entryPath: "agent-tool.schedule-create", rawText: "pending scheduled prompt" });
   });
 
   it("captures schedule-create as model delegation before the scheduler consumes it", async () => {
@@ -692,7 +787,7 @@ describe("remaining owned ingress paths", () => {
     expect(capture.log).toEqual(["capture", "spawn"]);
   });
 
-  it("handles a fleet-viewer capture that settles after guard unregister without steering", async () => {
+  it.each(["unregister", "replace"] as const)("handles a fleet-viewer capture that settles after registration %s without steering", async (change) => {
     const opened = boot();
     let release!: () => void;
     const pending = new Promise<void>(resolve => { release = resolve; });
@@ -742,6 +837,7 @@ describe("remaining owned ingress paths", () => {
     for (const character of "fleet pending steer") viewer.handleInput(character);
     viewer.handleInput("\r");
     host.unregister();
+    if (change === "replace") host.register(createCapture().registration);
     release();
     await flush();
     expect(capture.registration.callbacks.captureIngress).toHaveBeenCalledTimes(1);
@@ -778,7 +874,7 @@ describe("remaining owned ingress paths", () => {
     expect(spawn).toHaveBeenCalledTimes(1);
   });
 
-  it.each([true, false])("drops a deferred viewer steer if registration is removed before capture completes (guardExpected=%s)", async (guardExpected) => {
+  it.each([[true, "unregister"], [true, "replace"], [false, "unregister"], [false, "replace"]] as const)("drops a deferred viewer steer (guardExpected=%s, registration=%s)", async (guardExpected, change) => {
     const opened = boot({ guardExpected });
     let release!: () => void;
     const pending = new Promise<void>(resolve => { release = resolve; });
@@ -815,13 +911,12 @@ describe("remaining owned ingress paths", () => {
     viewer.handleInput("\r");
     for (const character of "pending viewer steer") viewer.handleInput(character);
     viewer.handleInput("\r");
-    await opened.lifecycle.get("session_before_switch")?.();
+    await changeRootRegistration(opened, change);
     release();
     await flush();
     expect(steer).not.toHaveBeenCalled();
     expect(capture.registration.callbacks.captureIngress).toHaveBeenCalledTimes(1);
-    if (guardExpected) expect(notify).toHaveBeenCalledWith(expect.stringContaining("guard-missing"), "warning");
-    else expect(notify).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("guard-missing"), "warning");
     expect(capture.log).toEqual(["capture"]);
     viewer.handleInput("q");
     await commandRun;
@@ -857,6 +952,75 @@ describe("programmatic ingress and path inventory", () => {
       entryPath: "cross-extension-rpc.spawn",
     });
     expect(capture.log).toEqual(["capture", "spawn"]);
+  });
+  it("forwards real extension manager ingress capture to RPC spawn and waits before spawning", async () => {
+    const opened = boot();
+    let releaseCapture!: () => void;
+    const capture = createCapture();
+    capture.registration.callbacks.captureIngress = vi.fn((evidence: any) => {
+      capture.log.push("capture");
+      capture.evidence.push(evidence);
+      return new Promise<void>((resolve) => { releaseCapture = resolve; });
+    });
+    await registerCapture(opened, capture);
+    const spawn = vi.spyOn(AgentManager.prototype, "spawn").mockImplementation(() => {
+      capture.log.push("spawn");
+      return "rpc-agent";
+    });
+    vi.spyOn(AgentManager.prototype, "awaitStartup").mockResolvedValue();
+    const reply = vi.fn();
+    opened.pi.events.on("subagents:rpc:spawn:reply:real-adapter", reply);
+    opened.pi.events.emit("subagents:rpc:spawn", {
+      requestId: "real-adapter", type: "explore", prompt: "real extension RPC request", options: {},
+    });
+
+    await vi.waitFor(() => expect(capture.registration.callbacks.captureIngress).toHaveBeenCalledTimes(1));
+    expect(capture.evidence[0]).toMatchObject({
+      rawText: "real extension RPC request",
+      coverage: "partial",
+      target: "session:s1",
+      origin: "extension-request",
+      entryPath: "cross-extension-rpc.spawn",
+    });
+    expect(spawn).not.toHaveBeenCalled();
+    expect(capture.log).toEqual(["capture"]);
+
+    releaseCapture();
+    await vi.waitFor(() => expect(reply).toHaveBeenCalledTimes(1));
+    expect(reply).toHaveBeenCalledWith({ success: true, data: { id: "rpc-agent" } });
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(capture.log).toEqual(["capture", "spawn"]);
+  });
+
+
+
+  it.each(["unregister", "replace"] as const)("rejects RPC spawn when its pending capture registration changes (%s)", async (change) => {
+    const opened = boot();
+    let release!: () => void;
+    let markStarted!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { markStarted = resolve; });
+    const capture = createCapture();
+    capture.registration.callbacks.captureIngress = vi.fn((evidence: any) => {
+      capture.evidence.push(evidence);
+      if (evidence.entryPath === "cross-extension-rpc.spawn") { markStarted(); return pending; }
+      return undefined;
+    });
+    await registerCapture(opened, capture);
+    const spawn = vi.spyOn(AgentManager.prototype, "spawn").mockImplementation(() => "rpc-pending-agent");
+    vi.spyOn(AgentManager.prototype, "awaitStartup").mockResolvedValue();
+    const reply = vi.fn();
+    opened.pi.events.on("subagents:rpc:spawn:reply:pending-change", reply);
+    opened.pi.events.emit("subagents:rpc:spawn", {
+      requestId: "pending-change", type: "explore", prompt: "pending RPC input", options: {},
+    });
+    await started;
+    await changeRootRegistration(opened, change);
+    release();
+    await vi.waitFor(() => expect(reply).toHaveBeenCalledTimes(1));
+    expect(reply.mock.calls[0][0]).toMatchObject({ success: false, error: expect.stringContaining("guard-missing") });
+    expect(spawn).not.toHaveBeenCalled();
+    expect(capture.evidence[0]).toMatchObject({ entryPath: "cross-extension-rpc.spawn", rawText: "pending RPC input" });
   });
 
 

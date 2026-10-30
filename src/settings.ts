@@ -540,21 +540,27 @@ function readSettingsFile(path: string): SettingsFileRead {
   const settings = sanitize(parsed);
   if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
     const record = parsed as Record<string, unknown>;
+    const invalidSettings = { ...settings };
+    let invalidGuardExpectedDiagnostic: string | undefined;
+    let invalidGuardRegistrantDiagnostic: string | undefined;
     if (Object.hasOwn(record, "guardExpected") && typeof record.guardExpected !== "boolean") {
       const value = record.guardExpected;
       const diagnostic = `guardExpected must be a boolean, received ${value === null ? "null" : typeof value}; treating guarded work as required until fixed`;
       warnGuardDiagnostic(path, diagnostic);
-      return {
-        settings: { ...settings, guardExpected: true },
-        guardExpectedDiagnostic: `${path}: ${diagnostic}`,
-      };
+      invalidSettings.guardExpected = true;
+      invalidGuardExpectedDiagnostic = `${path}: ${diagnostic}`;
     }
     if (Object.hasOwn(record, "guardRegistrant") && typeof record.guardRegistrant !== "string") {
       const diagnostic = `guardRegistrant must be a string, received ${record.guardRegistrant === null ? "null" : typeof record.guardRegistrant}`;
       warnGuardDiagnostic(path, diagnostic);
+      invalidSettings.guardRegistrant = "";
+      invalidGuardRegistrantDiagnostic = `guard-registrant-unconfigured: ${path}: ${diagnostic}`;
+    }
+    if (invalidGuardExpectedDiagnostic || invalidGuardRegistrantDiagnostic) {
       return {
-        settings: { ...settings, guardRegistrant: "" },
-        guardRegistrantDiagnostic: `guard-registrant-unconfigured: ${path}: ${diagnostic}`,
+        settings: invalidSettings,
+        ...(invalidGuardExpectedDiagnostic ? { guardExpectedDiagnostic: invalidGuardExpectedDiagnostic } : {}),
+        ...(invalidGuardRegistrantDiagnostic ? { guardRegistrantDiagnostic: invalidGuardRegistrantDiagnostic } : {}),
       };
     }
   }
@@ -622,7 +628,7 @@ export function saveSettings(s: SubagentsSettings, cwd: string = process.cwd()):
         // Retain configuration-only guard keys named by malformed project JSON.
         try {
           const text = readFileSync(path, "utf-8");
-          if (text.includes("guardExpected")) persisted.guardExpected = true;
+          if (text.includes("guardExpected") || text.includes("guardRegistrant")) persisted.guardExpected = true;
           if (text.includes("guardRegistrant")) persisted.guardRegistrant = "";
         } catch {
           // An unreadable file contains no safely preservable guard opt-in; do not infer one.

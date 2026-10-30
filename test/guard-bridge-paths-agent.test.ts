@@ -129,6 +129,11 @@ let current: Booted | undefined;
 let previousManager: unknown;
 let nextSession: ReturnType<typeof fakeSession> | undefined;
 
+let baselineCwd = "";
+let baselineAgentDir: string | undefined;
+let baselineHome: string | undefined;
+let baselineManager: unknown;
+
 function bootExtension(guardExpected = true): Booted {
   hermetic = hermeticDir({ settings: { outputTranscript: false, guardExpected, guardRegistrant: "scope-guard" } });
   previousManager = (globalThis as any)[managerKey];
@@ -152,6 +157,11 @@ function bootExtension(guardExpected = true): Booted {
   current = result;
   return result;
 }
+
+async function restoreCurrent(): Promise<void> {
+  if (current) await current.restore();
+}
+
 
 function configureScenario(manager: AgentManager, scenario: Scenario): void {
   if (scenario === "missing") {
@@ -224,6 +234,10 @@ function assertToolError(result: any, entryPath: EntryPath, scenario: "missing" 
 }
 
 beforeEach(() => {
+  baselineCwd = process.cwd();
+  baselineAgentDir = process.env.PI_CODING_AGENT_DIR;
+  baselineHome = process.env.HOME;
+  baselineManager = (globalThis as any)[managerKey];
   agentManagerMocks.instances.length = 0;
   cryptoSpies.createHash.mockClear();
   cryptoSpies.digest.mockClear();
@@ -235,7 +249,11 @@ beforeEach(() => {
   nextSession = undefined;
 });
 afterEach(async () => {
-  if (current) await current.restore();
+  await restoreCurrent();
+  expect(process.cwd()).toBe(baselineCwd);
+  expect(process.env.PI_CODING_AGENT_DIR).toBe(baselineAgentDir);
+  expect(process.env.HOME).toBe(baselineHome);
+  expect((globalThis as any)[managerKey]).toBe(baselineManager);
   expect(cryptoSpies.createHash.mock.calls.every(([algorithm]) => algorithm === "sha256")).toBe(true);
   expect(cryptoSpies.digest).not.toHaveBeenCalled();
 });
@@ -291,6 +309,8 @@ describe("real agent entry handlers require guard registration", () => {
             else expect(nextSession!.session.prompt).toHaveBeenCalledTimes(2);
           }
         }
+        await restoreCurrent();
+
       }
     },
   );
@@ -365,6 +385,8 @@ describe("real agent entry handlers require guard registration", () => {
           if (mode === "steer") expect(record.session.steer).toHaveBeenCalledTimes(steersBefore + 1);
         }
       }
+      await restoreCurrent();
+
     }
   });
 
@@ -461,7 +483,7 @@ describe("real agent entry handlers require guard registration", () => {
     },
   );
 
-  it("records a bounded diagnostic and suppresses a turn-limit steer after unregister", async () => {
+  it.each(["unregister", "replace"] as const)("records a diagnostic and suppresses a turn-limit steer after registration %s", async (change) => {
     const host = new GuardBridgeHost(true, "scope-guard");
     const bridgeRegistration = registration();
     let release!: () => void;
@@ -479,6 +501,7 @@ describe("real agent entry handlers require guard registration", () => {
     });
     await expect(run).resolves.toMatchObject({ steered: true });
     host.unregister();
+    if (change === "replace") host.register(registration());
     release();
     await new Promise(resolve => setImmediate(resolve));
     expect(nextSession.session.steer).not.toHaveBeenCalled();

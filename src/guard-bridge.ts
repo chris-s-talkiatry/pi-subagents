@@ -382,6 +382,7 @@ const ingressCaptureDiagnostics = new WeakMap<GuardBridgeHost, { epoch: string; 
 export class GuardBridgeHost {
   private registration: GuardBridgeRegistration | undefined;
   private registrationSnapshot: RegistrationSnapshot | undefined;
+  private ingressSnapshots = new WeakMap<GuardIngressEvidence, object>();
   private registrationRejected: string | undefined;
   private registrationRejectedReasonCode: GuardBridgeRejectionCode | undefined;
   private registrationRejectionHistory: string[] = [];
@@ -552,6 +553,7 @@ export class GuardBridgeHost {
       origin: input.origin,
       entryPath: input.entryPath,
     });
+    this.ingressSnapshots.set(evidence, snapshot);
 
     const recordFailure = (error: unknown): void => {
       const diagnostics = ingressCaptureDiagnostics.get(this)!;
@@ -564,21 +566,25 @@ export class GuardBridgeHost {
       if (diagnostics.failures.length > 10) diagnostics.failures.shift();
     };
 
+    const assertCaptureSnapshot = (): GuardIngressEvidence => {
+      this.assertRegistrationSnapshotActive(snapshot, input.entryPath);
+      return evidence;
+    };
     try {
       const result = snapshot.callbacks.captureIngress(evidence);
       if (result && typeof (result as Promise<void>).then === "function") {
         return Promise.resolve(result).then(
-          () => evidence,
+          assertCaptureSnapshot,
           error => {
             recordFailure(error);
-            return evidence;
+            return assertCaptureSnapshot();
           },
         );
       }
     } catch (error) {
       recordFailure(error);
     }
-    return evidence;
+    return assertCaptureSnapshot();
   }
 
 
@@ -587,26 +593,68 @@ export class GuardBridgeHost {
     return this.registrationSnapshot;
   }
 
-  /** Enroll applicable child resources through the frozen registration snapshot. */
-  async enrollResource(
+  /** Assert that capture evidence is still bound to its original frozen registration. */
+  assertIngressCaptureActive(evidence: GuardIngressEvidence | undefined, entryPath: GuardEntryPathId): void {
+    if (!evidence) return;
+    const snapshot = this.ingressSnapshots.get(evidence);
+    if (!snapshot) {
+      throw new GuardBridgeRejection(
+        "guard-missing",
+        entryPath,
+        `guard-missing: guarded work is unavailable at ${entryPath}; ingress evidence is not bound to this guard registration.`,
+      );
+    }
+    this.assertRegistrationSnapshotActive(snapshot, entryPath);
+  }
+
+  /** Reject work if the exact frozen registration captured before an await is no longer active. */
+  assertRegistrationSnapshotActive(snapshot: object | undefined, entryPath: GuardEntryPathId): void {
+    if (this.registrationSnapshot === snapshot) {
+      if (snapshot === undefined && this.expected) this.assertGuard(entryPath);
+      return;
+    }
+    if (this.expected && this.registrationSnapshot === undefined) this.assertGuard(entryPath);
+    throw new GuardBridgeRejection(
+      "guard-missing",
+      entryPath,
+      `guard-missing: guarded work is unavailable at ${entryPath}; the guard registration changed while the operation was pending.`,
+    );
+  }
+
+  /** Enroll through one caller-selected frozen registration snapshot. */
+  async enrollResourceForSnapshot(
     enrollment: GuardResourceEnrollment,
-    entryPath: GuardEntryPathId = "agent-manager.spawn",
+    entryPath: GuardEntryPathId,
+    snapshot: object | undefined,
   ): Promise<boolean> {
     const requirement = this.requireGuard(entryPath);
     if (!requirement.ok) throw requirement.rejection;
-    const snapshot = this.registrationSnapshot;
+    this.assertRegistrationSnapshotActive(snapshot, entryPath);
     if (!snapshot) return false;
 
+    // The identity is opaque to callers; the host owns the concrete immutable snapshot.
+    const registrationSnapshot = this.registrationSnapshot;
+    if (registrationSnapshot !== snapshot) this.assertRegistrationSnapshotActive(snapshot, entryPath);
     try {
-      await snapshot.callbacks.enrollResource(enrollment);
+      await (registrationSnapshot as RegistrationSnapshot).callbacks.enrollResource(enrollment);
+      this.assertRegistrationSnapshotActive(snapshot, entryPath);
       return true;
-    } catch {
+    } catch (error) {
+      if (error instanceof GuardBridgeRejection) throw error;
       throw new GuardBridgeRejection(
         "guard-enrollment-failed",
         entryPath,
         `guard-enrollment-failed: guarded work is unavailable at ${entryPath}; resource enrollment callback failed; child dispatch was stopped.`,
       );
     }
+  }
+
+  /** Enroll applicable child resources through the currently active snapshot. */
+  async enrollResource(
+    enrollment: GuardResourceEnrollment,
+    entryPath: GuardEntryPathId = "agent-manager.spawn",
+  ): Promise<boolean> {
+    return this.enrollResourceForSnapshot(enrollment, entryPath, this.registrationSnapshot);
   }
 
   requireGuard(entryPath: GuardEntryPathId): GuardRequirementResult {

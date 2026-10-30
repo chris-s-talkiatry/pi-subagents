@@ -433,10 +433,8 @@ export class FleetList {
                 entryPath: "fleet-viewer.steer",
               });
               if (capture && typeof (capture as Promise<unknown>).then === "function") {
-                const registration = this.manager.guardBridgeHost?.getRegistration?.();
-                void (capture as Promise<unknown>).then(() => {
-                  if (this.manager.guardBridgeHost.guardExpected) this.manager.assertGuard?.("fleet-viewer.steer");
-                  else if (registration && this.manager.guardBridgeHost?.getRegistration?.() !== registration) return;
+                void (capture as Promise<import("../guard-bridge.js").GuardIngressEvidence>).then((evidence) => {
+                  this.manager.assertIngressCaptureActive(evidence, "fleet-viewer.steer");
                   this.manager.steer(record.id, message);
                 }).catch((error) => {
                   if (error instanceof GuardBridgeRejection) this.ui?.notify(error.message, "warning");

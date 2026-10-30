@@ -805,7 +805,10 @@ export default function (pi: ExtensionAPI) {
         entryPath: "manager-registry.spawn",
       });
       if (isIngressCapturePending(capture)) {
-        return capture.then(() => spawnTopLevel(piRef, ctxRef, type, prompt, options, "manager-registry.spawn"));
+        return capture.then((evidence) => {
+          manager.assertIngressCaptureActive(evidence, "manager-registry.spawn");
+          return spawnTopLevel(piRef, ctxRef, type, prompt, options, "manager-registry.spawn");
+        });
       }
       return spawnTopLevel(piRef, ctxRef, type, prompt, options, "manager-registry.spawn");
     },
@@ -876,6 +879,7 @@ export default function (pi: ExtensionAPI) {
         manager: {
           spawn: spawnTopLevel,
           assertGuard: (entryPath) => manager.assertGuard(entryPath),
+          captureIngress: (input) => manager.captureIngress(input),
           awaitStartup: (id) => manager.awaitStartup(id),
           getRecord: (id) => manager.getRecord(id),
           // Unguarded on purpose: the stop handler now runs the top-level check
@@ -977,7 +981,7 @@ export default function (pi: ExtensionAPI) {
       try {
       manager.assertGuard(entryPath);
 
-        await manager.captureIngress({
+        const capture = await manager.captureIngress({
           rawText: event.text,
           transformedText: mention.message,
           coverage: "complete",
@@ -985,6 +989,7 @@ export default function (pi: ExtensionAPI) {
           origin: "human",
           entryPath,
         });
+        manager.assertIngressCaptureActive(capture, entryPath);
         return false;
       } catch (error) {
         if (!(error instanceof GuardBridgeRejection)) throw error;
@@ -2077,13 +2082,14 @@ Terse command-style prompts produce shallow, generic work.
           return textResult("Scheduler is not active in this session yet. Try again after the session has fully started.");
         }
         manager.assertGuard("agent-tool.schedule-create");
-        await manager.captureIngress({
+        const capture = await manager.captureIngress({
           rawText: params.prompt,
           coverage: "complete",
           target: ingressSessionTarget(ctx),
           origin: "parent-model-delegation",
           entryPath: "agent-tool.schedule-create",
         });
+        manager.assertIngressCaptureActive(capture, "agent-tool.schedule-create");
 
         try {
           const job = scheduler.addJob({
@@ -3284,13 +3290,12 @@ Terse command-style prompts produce shallow, generic work.
               entryPath: "conversation-viewer.steer",
             });
             if (isIngressCapturePending(capture)) {
-              const registration = manager.guardBridgeHost.getRegistration();
-              void capture.then(() => {
-                if (manager.guardBridgeHost.guardExpected) manager.assertGuard("conversation-viewer.steer");
-                else if (registration && manager.guardBridgeHost.getRegistration() !== registration) return;
+              void capture.then((evidence) => {
+                manager.assertIngressCaptureActive(evidence, "conversation-viewer.steer");
                 manager.steer(record.id, message);
               }).catch((error) => reportDeferredSteerFailure("conversation-viewer.steer", error, ctx.ui));
             } else {
+              manager.assertIngressCaptureActive(capture, "conversation-viewer.steer");
               manager.steer(record.id, message);
             }
           } catch (error) {

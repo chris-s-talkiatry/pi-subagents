@@ -407,9 +407,20 @@ export class AgentManager {
   }
 
   captureIngress(input: GuardIngressInput): GuardIngressEvidence | Promise<GuardIngressEvidence> | undefined {
-    return this.guardBridgeHost.captureIngress(input);
+    const capture = this.guardBridgeHost.captureIngress(input);
+    if (capture && typeof (capture as Promise<GuardIngressEvidence>).then === "function") {
+      return Promise.resolve(capture).then(evidence => {
+        this.guardBridgeHost.assertIngressCaptureActive(evidence, input.entryPath);
+        return evidence;
+      });
+    }
+    this.guardBridgeHost.assertIngressCaptureActive(capture as GuardIngressEvidence | undefined, input.entryPath);
+    return capture;
   }
 
+  assertIngressCaptureActive(evidence: GuardIngressEvidence | undefined, entryPath: GuardEntryPathId): void {
+    this.guardBridgeHost.assertIngressCaptureActive(evidence, entryPath);
+  }
 
 
   private agents = new Map<string, AgentRecord>();
@@ -1249,7 +1260,7 @@ export class AgentManager {
     record.error = undefined;
 
     try {
-      const { text, failure } = await resumeAgent(record.session, prompt, {
+      const { text, failure, aborted } = await resumeAgent(record.session, prompt, {
         onToolActivity: (activity) => {
           if (activity.type === "end") record.toolUses++;
           resumeOptions?.onToolActivity?.(activity);
@@ -1271,7 +1282,9 @@ export class AgentManager {
       });
       // Same contract as the spawn path (#144): a failed final turn is an
       // error, not a completion — but the resumed text stays available.
-      record.status = failure ? "error" : "completed";
+      if ((record.status as string) !== "stopped") {
+        record.status = aborted ? "aborted" : failure ? "error" : "completed";
+      }
       if (failure) record.error = failure;
       record.result = text;
       record.completedAt = Date.now();
@@ -1370,12 +1383,12 @@ export class AgentManager {
       guardBridgeHost: this.guardBridgeHost,
       guardExpected: this.guardBridgeHost.guardExpected,
     })
-      .then(({ text, failure }) => {
+      .then(({ text, failure, aborted }) => {
         // Don't overwrite status if externally stopped via abort().
         if (record.status !== "stopped") {
           // Same contract as the spawn path (#144): a failed final turn is an
           // error, not a completion — but the resumed text stays available.
-          record.status = failure ? "error" : "completed";
+          record.status = aborted ? "aborted" : failure ? "error" : "completed";
           if (failure) record.error = failure;
         }
         record.result = text;

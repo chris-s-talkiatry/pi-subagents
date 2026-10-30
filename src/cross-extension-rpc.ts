@@ -39,8 +39,7 @@ export const PROTOCOL_VERSION = 2;
 export interface SpawnCapable {
   spawn(pi: unknown, ctx: unknown, type: string, prompt: string, options: any): string;
   assertGuard?(entryPath: GuardEntryPathId): unknown;
-  captureIngress?(input: GuardIngressInput): GuardIngressEvidence | Promise<GuardIngressEvidence> | undefined;
-  /** Resolves once the spawned agent is running; rejects on a startup failure. */
+  captureIngress(input: GuardIngressInput): GuardIngressEvidence | Promise<GuardIngressEvidence> | undefined;
   awaitStartup(id: string): Promise<void>;
   abort(id: string): boolean;
   /**

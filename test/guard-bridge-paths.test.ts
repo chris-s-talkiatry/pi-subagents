@@ -273,6 +273,8 @@ describe("guard registration at real entry paths", () => {
       getCtx: () => ({}),
       manager: {
         spawn,
+        captureIngress: vi.fn(),
+
         assertGuard: (entryPath) => bridge.assertGuard(entryPath),
         awaitStartup: vi.fn(),
         abort: vi.fn(),

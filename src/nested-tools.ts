@@ -93,6 +93,7 @@ export interface NestedAgentManager {
   getRecord(id: string): AgentRecord | undefined;
   assertGuard?(entryPath: GuardEntryPathId): unknown;
   captureIngress?(input: GuardIngressInput): GuardIngressEvidence | Promise<GuardIngressEvidence> | undefined;
+  assertIngressCaptureActive?(evidence: GuardIngressEvidence | undefined, entryPath: GuardEntryPathId): void;
   resume(
     id: string,
     prompt: string,
@@ -202,13 +203,14 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           return textResult(`Nested agent not found or not owned by this parent: "${params.resume}".`, true);
 
         }
-        await context.manager.captureIngress?.({
+        const capture = await context.manager.captureIngress?.({
           rawText: params.prompt,
           coverage: "complete",
           target: `agent:${existing.id}`,
           origin: "parent-model-delegation",
           entryPath: "nested-agent.resume",
         });
+        context.manager.assertIngressCaptureActive?.(capture, "nested-agent.resume");
 
         const resumed = await context.manager.resume(params.resume, params.prompt, signal, {
           guardEntryPath: "nested-agent.resume",
@@ -360,14 +362,15 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       // report it as a tool error, like the top-level Agent tool does, instead of
       // letting it escape into the child's turn.
       try {
-        await context.manager.captureIngress?.({
+        const capture = await context.manager.captureIngress?.({
           rawText: params.prompt,
           coverage: "complete",
           target: ingressSessionTarget(ctx),
           origin: "parent-model-delegation",
           entryPath: invocation.runInBackground ? "nested-agent.spawn-background" : "nested-agent.spawn-foreground",
         });
-
+        const entryPath = invocation.runInBackground ? "nested-agent.spawn-background" : "nested-agent.spawn-foreground";
+        context.manager.assertIngressCaptureActive?.(capture, entryPath);
 
         if (invocation.runInBackground) {
           const id = context.manager.spawn(context.pi, ctx, resolvedType, params.prompt, {
@@ -440,13 +443,14 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       if (!ownsRecord(record, context.parentAgentId) || record.status !== "running") {
         return textResult(`Running nested agent not found or not owned by this parent: "${params.agent_id}".`, true);
       }
-      await context.manager.captureIngress?.({
+      const capture = await context.manager.captureIngress?.({
         rawText: params.message,
         coverage: "complete",
         target: `agent:${record.id}`,
         origin: "parent-model-delegation",
         entryPath: "nested-agent.steer",
       });
+      context.manager.assertIngressCaptureActive?.(capture, "nested-agent.steer");
 
       // Session not ready yet — queue the steer. The manager flushes pending
       // steers when the session is created (same contract as the top-level tool).
