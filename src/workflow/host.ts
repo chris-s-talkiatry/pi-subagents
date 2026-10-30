@@ -175,6 +175,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
    * decided from one behaviour, whichever route the command took.
    */
   async function executeGate(command: string, cwd: string): Promise<WorkflowGateResult> {
+    manager.assertGuard?.("workflow.pi-exec.gate");
     const result = await pi.exec(GATE_SHELL[0], [GATE_SHELL[1], command], {
       cwd,
       timeout: deps.gateTimeoutMs ?? DEFAULT_GATE_TIMEOUT_MS,
@@ -298,6 +299,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
           request.prompt,
           {
             description: request.label,
+            guardEntryPath: "workflow-host.spawn",
             // The stamp is what keeps this child out of the session's
             // `maxConcurrent` pool — see `occupiesPoolSlot`. The run already
             // bounds how many of its agents run at once, and counting them
@@ -366,6 +368,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       if (id === undefined) {
         return { ok: false, error: `Cannot resume "${agentId}" — it never started.` };
       }
+      manager.assertGuard?.("workflow-host.resume");
       const record = await manager.resume(id, prompt, deps.signal);
       if (record === undefined) {
         return {

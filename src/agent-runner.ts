@@ -2,6 +2,7 @@
  * agent-runner.ts — Core execution engine: creates sessions, runs agents, collects results.
  */
 
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -22,15 +23,15 @@ import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
+import { type GuardBridgeHost, type GuardBridgeRegistration, GuardBridgeRejection, type GuardEntryPathId, type GuardResourceEnrollment } from "./guard-bridge.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
-import type { SubagentType, ThinkingLevel } from "./types.js";
+import type { AgentConfig, SubagentType, ThinkingLevel } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
-
 /**
  * Tool names registered by THIS extension. Single source of truth so the
  * registration sites (index.ts) and the subagent exclusion list below can't
@@ -46,6 +47,93 @@ export const SUBAGENT_TOOL_NAMES = {
 
 /** Names of tools registered by this extension that subagents must NOT inherit. */
 const EXCLUDED_TOOL_NAMES: string[] = Object.values(SUBAGENT_TOOL_NAMES);
+
+const RESOURCE_REFERENCE_LIMIT = 65_536;
+const sessionResourceEnrollments = new WeakMap<AgentSession, {
+  resources: readonly GuardResourceEnrollment[];
+  enrolledByRegistration: WeakMap<object, Set<string>>;
+}>();
+
+function resourceKey(resource: GuardResourceEnrollment): string {
+  return `${resource.sourceIdentity}\0${resource.sourceVersion}`;
+}
+
+type AgentDefinitionSource = "project" | "global" | "builtin";
+
+function agentDefinitionSource(config: AgentConfig): AgentDefinitionSource | undefined {
+  if (config.source === "project" || config.source === "global") return config.source;
+  if (config.source === "default" || config.isDefault === true) return "builtin";
+  return undefined;
+}
+
+function boundedResourceText(text: string): string {
+  const bytes = Buffer.from(text, "utf8");
+  if (bytes.byteLength <= RESOURCE_REFERENCE_LIMIT) return text;
+  const marker = "\n[truncated: restriction text reference limited to 64 KiB]";
+  const budget = RESOURCE_REFERENCE_LIMIT - Buffer.byteLength(marker, "utf8");
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let end = budget;
+  while (end > 0) {
+    try {
+      return decoder.decode(bytes.subarray(0, end)) + marker;
+    } catch {
+      end--;
+    }
+  }
+  return marker.slice(-RESOURCE_REFERENCE_LIMIT);
+}
+
+function makeResourceEnrollment(
+  kind: GuardResourceEnrollment["kind"],
+  sourceIdentity: string,
+  text: string | undefined,
+  childId: string | undefined,
+): GuardResourceEnrollment {
+  const resolved = text !== undefined;
+  const truncated = resolved && Buffer.byteLength(text, "utf8") > RESOURCE_REFERENCE_LIMIT;
+  const sourceVersion = resolved ? createHash("sha256").update(text, "utf8").digest("hex") : "unresolved";
+  const resolvedRestrictionTextRefs = resolved
+    ? Object.freeze([Object.freeze({ sourceIdentity, sourceVersion, textReference: boundedResourceText(text) })])
+    : Object.freeze([]);
+  return Object.freeze({
+    kind,
+    sourceIdentity,
+    sourceVersion,
+    ...(childId !== undefined ? { childId } : {}),
+    provenance: "child-preload" as const,
+    ...(!resolved || truncated ? { resolution: "unresolved" as const } : {}),
+    resolvedRestrictionTextRefs,
+  });
+}
+
+async function enrollResolvedResources(
+  host: GuardBridgeHost | undefined,
+  guardExpected: boolean,
+  resources: readonly GuardResourceEnrollment[],
+  enrolledByRegistration: WeakMap<object, Set<string>>,
+  entryPath: GuardEntryPathId,
+): Promise<void> {
+  if (!host) {
+    if (guardExpected) {
+      throw new GuardBridgeRejection("guard-missing", entryPath,
+        `guard-missing: guarded work is unavailable at ${entryPath}; no guard bridge host is present for resource enrollment.`);
+    }
+    return;
+  }
+  for (const resource of resources) {
+    const key = resourceKey(resource);
+    const registrationIdentity = host.getResourceEnrollmentSnapshotIdentity();
+    if (registrationIdentity && enrolledByRegistration.get(registrationIdentity)?.has(key)) continue;
+    if (await host.enrollResource(resource, entryPath) && registrationIdentity) {
+      let enrolled = enrolledByRegistration.get(registrationIdentity);
+      if (!enrolled) {
+        enrolled = new Set<string>();
+        enrolledByRegistration.set(registrationIdentity, enrolled);
+      }
+      enrolled.add(key);
+    }
+  }
+}
 
 /**
  * Canonical name of an extension for `extensions: [...]` allowlist matching.
@@ -395,6 +483,12 @@ export interface ToolActivity {
 }
 
 export interface RunOptions {
+  /** Retained versioned guard registration passed directly from the manager. */
+  guardBridgeRegistration?: GuardBridgeRegistration;
+  /** Root-owned guard host for internal deferred steering checks. */
+  guardBridgeHost?: GuardBridgeHost;
+  /** Captured at manager dispatch, so a missing host still fails closed. */
+  guardExpected?: boolean;
   /** ExtensionAPI instance — used for pi.exec() instead of execSync. */
   pi: ExtensionAPI;
   /** Manager-assigned id; suffixes session name to disambiguate parallel spawns (e.g. `Explore#a1b2c3d4`). */
@@ -629,6 +723,7 @@ export async function runAgent(
 
   // Build prompt extras (memory, skill preloading)
   const extras: PromptExtras = {};
+  let preloadedSkills: ReturnType<typeof preloadSkills> = [];
   if (options.worktreeBase) extras.worktreeBase = options.worktreeBase;
   if (options.workflow && !options.structuredOutput) extras.workflowChild = true;
 
@@ -642,6 +737,7 @@ export async function runAgent(
   // Skill preloading: when skills is string[], preload their content into prompt
   if (Array.isArray(skills)) {
     const loaded = preloadSkills(skills, configCwd);
+    preloadedSkills = loaded;
     if (loaded.length > 0) {
       extras.skillBlocks = loaded;
     }
@@ -672,6 +768,7 @@ export async function runAgent(
 
   // Build system prompt from agent config
   let systemPrompt: string;
+  let resolvedAgentDefinition = agentConfig;
   if (agentConfig) {
     systemPrompt = buildAgentPrompt(agentConfig, effectiveCwd, env, parentSystemPrompt, extras);
   } else {
@@ -679,7 +776,38 @@ export async function runAgent(
     // unreachable in practice since index.ts resolves unknown types before calling runAgent).
     const fallback = DEFAULT_AGENTS.get("general-purpose");
     if (!fallback) throw new Error(`No fallback config available for unknown type "${type}"`);
-    systemPrompt = buildAgentPrompt({ ...fallback, name: type }, effectiveCwd, env, parentSystemPrompt, extras);
+    resolvedAgentDefinition = { ...fallback, name: type };
+    systemPrompt = buildAgentPrompt(resolvedAgentDefinition, effectiveCwd, env, parentSystemPrompt, extras);
+  }
+
+  const definitionSource = resolvedAgentDefinition ? agentDefinitionSource(resolvedAgentDefinition) : undefined;
+  const resources: GuardResourceEnrollment[] = options.guardBridgeHost
+    ? [
+        ...preloadedSkills.map((skill) => makeResourceEnrollment(
+          "skill",
+          `skill:${skill.sourceIdentity ?? skill.name}`,
+          skill.resolved === false ? undefined : (skill.sourceText ?? skill.content),
+          options.agentId,
+        )),
+        ...(resolvedAgentDefinition && definitionSource
+          ? [makeResourceEnrollment(
+              "agent-definition",
+              `agent-definition:${definitionSource}:${resolvedAgentDefinition.name}`,
+              resolvedAgentDefinition.systemPrompt,
+              options.agentId,
+            )]
+          : []),
+      ]
+    : [];
+  const enrolledByRegistration = new WeakMap<object, Set<string>>();
+  if (resources.length > 0) {
+    await enrollResolvedResources(
+      options.guardBridgeHost,
+      options.guardExpected === true,
+      resources,
+      enrolledByRegistration,
+      "agent-manager.spawn",
+    );
   }
 
   // When skills is string[], we've already preloaded them into the prompt.
@@ -1006,6 +1134,9 @@ export async function runAgent(
   }
 
   const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
+  if (options.guardBridgeHost && resources.length > 0) {
+    sessionResourceEnrollments.set(session, { resources, enrolledByRegistration });
+  }
 
   const baseSessionName = agentConfig?.name ?? type;
   session.setSessionName(
@@ -1042,7 +1173,14 @@ export async function runAgent(
     });
   }
 
-  options.onSessionCreated?.(session);
+  try {
+    options.onSessionCreated?.(session);
+  } catch (error) {
+    // The callback runs after createAgentSession and bindExtensions. A rejected
+    // pending steer must release the created session rather than leaking it.
+    try { session.dispose?.(); } catch { /* preserve the original callback rejection */ }
+    throw error;
+  }
 
   // Track turns for graceful max_turns enforcement
   let turnCount = 0;
@@ -1058,7 +1196,35 @@ export async function runAgent(
       if (maxTurns != null) {
         if (!softLimitReached && turnCount >= maxTurns) {
           softLimitReached = true;
-          session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
+          if (options.guardExpected && !options.guardBridgeHost) {
+            throw new GuardBridgeRejection(
+              "guard-missing",
+              "agent-runner.turn-limit-steer",
+              "guard-missing: guarded work is unavailable at agent-runner.turn-limit-steer; no guard bridge host is present in runner options.",
+            );
+          }
+          options.guardBridgeHost?.assertGuard("agent-runner.turn-limit-steer");
+          const message = "You have reached your turn limit. Wrap up immediately — provide your final answer now.";
+          const sessionId = session.sessionManager?.getSessionId?.();
+          const capture = options.guardBridgeHost?.captureIngress({
+            rawText: message,
+            coverage: "complete",
+            target: options.agentId ? `agent:${options.agentId}` : `session:${sessionId ?? "unknown"}`,
+            origin: "package-system-control",
+            entryPath: "agent-runner.turn-limit-steer",
+          });
+          if (capture && typeof (capture as Promise<unknown>).then === "function") {
+            const registration = options.guardBridgeHost?.getRegistration?.();
+            void (capture as Promise<unknown>).then(() => {
+              if (options.guardExpected) options.guardBridgeHost?.assertGuard("agent-runner.turn-limit-steer");
+              else if (registration && options.guardBridgeHost?.getRegistration?.() !== registration) return;
+              return session.steer(message);
+            }).catch((error) => {
+              options.guardBridgeHost?.recordIngressContinuationFailure("agent-runner.turn-limit-steer", error);
+            });
+          } else {
+            session.steer(message);
+          }
         } else if (softLimitReached && turnCount >= maxTurns + graceTurns) {
           aborted = true;
           session.abort();
@@ -1159,8 +1325,23 @@ export async function resumeAgent(
     onAssistantUsage?: (usage: LifetimeUsage) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
     signal?: AbortSignal;
+    /** Retained versioned guard registration passed directly from the manager. */
+    guardBridgeRegistration?: GuardBridgeRegistration;
+    guardBridgeHost?: GuardBridgeHost;
+    guardExpected?: boolean;
   } = {},
 ): Promise<{ text: string; failure?: string }> {
+  const resourceState = sessionResourceEnrollments.get(session);
+  if (resourceState) {
+    await enrollResolvedResources(
+      options.guardBridgeHost,
+      options.guardExpected === true,
+      resourceState.resources,
+      resourceState.enrolledByRegistration,
+      "agent-manager.resume",
+    );
+  }
+
   // Boundary for the history fallback: the session already holds prior turns,
   // so only assistant text produced by THIS resume prompt counts as its output
   // — a failed resume must not surface the previous turn's answer (#144).

@@ -16,6 +16,7 @@ import {
   resolveTypeIn,
 } from "./agent-types.js";
 import { loadCustomAgents } from "./custom-agents.js";
+import type { GuardEntryPathId, GuardIngressEvidence, GuardIngressInput } from "./guard-bridge.js";
 import { isolationParam, resolveAgentInvocationConfig } from "./invocation-config.js";
 import { resolveModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
@@ -60,6 +61,7 @@ interface NestedSpawnOptions {
   isolation?: IsolationMode;
   invocation?: AgentInvocation;
   signal?: AbortSignal;
+  guardEntryPath?: GuardEntryPathId;
   onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
   onSessionCreated?: (session: AgentSession) => void;
   depth: number;
@@ -89,7 +91,14 @@ export interface NestedAgentManager {
     onSpawned?: (id: string) => void,
   ): Promise<{ id: string; record: AgentRecord }>;
   getRecord(id: string): AgentRecord | undefined;
-  resume(id: string, prompt: string, signal?: AbortSignal): Promise<AgentRecord | undefined>;
+  assertGuard?(entryPath: GuardEntryPathId): unknown;
+  captureIngress?(input: GuardIngressInput): GuardIngressEvidence | Promise<GuardIngressEvidence> | undefined;
+  resume(
+    id: string,
+    prompt: string,
+    signal?: AbortSignal,
+    options?: { guardEntryPath?: GuardEntryPathId },
+  ): Promise<AgentRecord | undefined>;
 }
 
 export interface NestedToolContext {
@@ -107,6 +116,12 @@ export interface NestedToolContext {
 function textResult(text: string, isError = false) {
   return { content: [{ type: "text" as const, text }], isError, details: {} };
 }
+
+function ingressSessionTarget(ctx: any): string {
+  const id = ctx?.sessionManager?.getSessionId?.();
+  return typeof id === "string" && id.length > 0 ? `session:${id}` : "session:unknown";
+}
+
 
 function ownsRecord(record: AgentRecord | undefined, parentAgentId: string): record is AgentRecord {
   return record?.parentAgentId === parentAgentId;
@@ -185,8 +200,19 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         const existing = context.manager.getRecord(params.resume);
         if (!ownsRecord(existing, context.parentAgentId)) {
           return textResult(`Nested agent not found or not owned by this parent: "${params.resume}".`, true);
+
         }
-        const resumed = await context.manager.resume(params.resume, params.prompt, signal);
+        await context.manager.captureIngress?.({
+          rawText: params.prompt,
+          coverage: "complete",
+          target: `agent:${existing.id}`,
+          origin: "parent-model-delegation",
+          entryPath: "nested-agent.resume",
+        });
+
+        const resumed = await context.manager.resume(params.resume, params.prompt, signal, {
+          guardEntryPath: "nested-agent.resume",
+        });
         return resumed
           ? textResult(formatRecord(resumed, "inline"), resumed.status === "error")
           : textResult(`Failed to resume nested agent "${params.resume}".`, true);
@@ -250,6 +276,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         modelInput: invocation.modelInput,
       });
       if (scopeVerdict.kind === "error") return textResult(scopeVerdict.message, true);
+
 
       // The whole branch shares the root session's transcript directory; read it
       // off the owning parent rather than this child session's own id.
@@ -333,9 +360,19 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       // report it as a tool error, like the top-level Agent tool does, instead of
       // letting it escape into the child's turn.
       try {
+        await context.manager.captureIngress?.({
+          rawText: params.prompt,
+          coverage: "complete",
+          target: ingressSessionTarget(ctx),
+          origin: "parent-model-delegation",
+          entryPath: invocation.runInBackground ? "nested-agent.spawn-background" : "nested-agent.spawn-foreground",
+        });
+
+
         if (invocation.runInBackground) {
           const id = context.manager.spawn(context.pi, ctx, resolvedType, params.prompt, {
             ...options,
+            guardEntryPath: "nested-agent.spawn-background",
             isBackground: true,
           });
           // Synchronous, before the event loop yields — onSessionCreated fires
@@ -352,7 +389,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           ctx,
           resolvedType,
           params.prompt,
-          { ...options, signal },
+          { ...options, guardEntryPath: "nested-agent.spawn-foreground", signal },
           attachTranscript,
         );
         return textResult(formatRecord(record, "inline"), record.status === "error");
@@ -398,10 +435,19 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       message: Type.String(),
     }),
     execute: async (_toolCallId, params) => {
+      context.manager.assertGuard?.("nested-agent.steer");
       const record = context.manager.getRecord(params.agent_id);
       if (!ownsRecord(record, context.parentAgentId) || record.status !== "running") {
         return textResult(`Running nested agent not found or not owned by this parent: "${params.agent_id}".`, true);
       }
+      await context.manager.captureIngress?.({
+        rawText: params.message,
+        coverage: "complete",
+        target: `agent:${record.id}`,
+        origin: "parent-model-delegation",
+        entryPath: "nested-agent.steer",
+      });
+
       // Session not ready yet — queue the steer. The manager flushes pending
       // steers when the session is created (same contract as the top-level tool).
       if (!record.session) {

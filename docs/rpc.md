@@ -137,7 +137,7 @@ One related thing that lives nowhere else: on every top-level settle, pi-subagen
 |---|---|---|
 | `waitForAll()` | `() => Promise<void>` | Resolves when nothing is running. **All** agents, including ones you did not spawn — a shutdown barrier, not a join |
 | `hasRunning()` | `() => boolean` | |
-| `spawn(pi, ctx, type, prompt, options)` | `=> string` | **Is** `spawnTopLevel`, so the strip list above applies identically |
+| `spawn(pi, ctx, type, prompt, options)` | `=> string` normally; `Promise<string>` when a registered guard's `captureIngress` returns a promise | **Is** `spawnTopLevel`, so the strip list above applies identically. With no registration / optional guard-off capture, the return remains a synchronous string. |
 | `getRecord(id)` | `=> AgentRecord \| undefined` | Filtered through `isTopLevelAgent`, so someone else's child comes back `undefined` rather than leaking |
 
 The slot is claimed by the first activation only; subagent sessions re-activate this extension in the same process, and unconditionally overwriting would point the registry at a short-lived child manager whose shutdown would then delete the root session's entry ([#128](https://github.com/tintinweb/pi-subagents/pull/128)). Child activations leave it alone, and shutdown releases it only if this activation claimed it (`src/index.ts:747-750`, `:1105-1107`).
@@ -156,11 +156,11 @@ So: send `consume` unconditionally and ignore the outcome — an older build has
 
 ## Availability
 
-`subagents:ready` is the discovery signal, and both the RPC handlers and the event itself are wired on the first bound `session_start` (`src/index.ts:789`, `:799`, `:827`) — deliberately not at factory time. pi runs every extension factory *before* applying an agent's `extensions:` filter and only delivers lifecycle events to the survivors, so a factory-time broadcast made a filtered-out session advertise a spawn service it could never provide: `ping` succeeded and every `spawn` answered `No active session` ([#142](https://github.com/tintinweb/pi-subagents/issues/142)).
+`subagents:ready` is the discovery signal. The `session_start` handler binds the active context, registers RPC handlers and emits readiness — deliberately not at factory time. Pi runs every extension factory *before* applying an agent's `extensions:` filter and only delivers lifecycle events to survivors, so a factory-time broadcast made a filtered-out session advertise a spawn service it could never provide ([#142](https://github.com/tintinweb/pi-subagents/issues/142)).
 
-The consequence is worth stating plainly: **a session that excludes pi-subagents is indistinguishable from pi-subagents not being installed.** It emits no `subagents:ready` and answers nothing. Give discovery a timeout and treat expiry as "not available here" rather than waiting indefinitely. The payload is `{}` — read nothing off it. Handlers are torn down and the flag reset on `session_shutdown` (`src/index.ts:1100-1103`), so a later `session_start` re-registers and re-emits.
+The consequence is worth stating plainly: **a session that excludes pi-subagents is indistinguishable from pi-subagents not being installed.** It emits no `subagents:ready` and answers nothing. The payload is `{ guardBridge: advertisement }`; `advertisement` reports protocol `pi-subagents.guard-bridge` version 1, supported outcomes, effective `guardExpected`, configured `guardRegistrant`, `configDiagnostic`, and registration diagnostics. The read-only `subagents:rpc:guard-bridge` channel returns the same current advertisement in the standard reply envelope. Guards should listen for `subagents:ready` and emit `subagents:guard:register` only after receiving it. A `/new` or `/resume` session switch unregisters the current guard and the next active `session_start` emits `subagents:ready` once again. Registrations before `session_start`, after shutdown, or after switch are rejected and do not trigger readiness. A filtered session never reaches `session_start` and never advertises.
 
-One more trap on the way in: an RPC-spawned agent emits **no `subagents:created`**. The only two emit sites are the `Agent` tool's background branch (`src/index.ts:2104`) and detached resume (`:1350`). Your first event for your own agent is `subagents:started` (`:625`), so key your bookkeeping off the id that `spawn` handed you, not off `subagents:created`.
+One more trap on the way in: an RPC-spawned agent emits **no `subagents:created`**. The emit sites are the `Agent.execute` background branch and detached `Agent.execute` resume branch. Your first event for your own agent is `subagents:started`, so key your bookkeeping off the id that `spawn` handed you, not off `subagents:created`.
 
 ## What the tests pin
 

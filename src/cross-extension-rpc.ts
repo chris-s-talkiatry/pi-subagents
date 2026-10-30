@@ -14,6 +14,9 @@
  */
 
 import { isTopLevelAgent } from "./agent-manager.js";
+import type { GuardIngressEvidence, GuardIngressInput } from "./guard-bridge.js";
+import { GUARD_BRIDGE_PROTOCOL_ADVERTISEMENT, type GuardEntryPathId } from "./guard-bridge.js";
+
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
 import type { AgentRecord } from "./types.js";
@@ -35,6 +38,8 @@ export const PROTOCOL_VERSION = 2;
 /** Minimal AgentManager interface needed by the spawn/stop/consume RPCs. */
 export interface SpawnCapable {
   spawn(pi: unknown, ctx: unknown, type: string, prompt: string, options: any): string;
+  assertGuard?(entryPath: GuardEntryPathId): unknown;
+  captureIngress?(input: GuardIngressInput): GuardIngressEvidence | Promise<GuardIngressEvidence> | undefined;
   /** Resolves once the spawned agent is running; rejects on a startup failure. */
   awaitStartup(id: string): Promise<void>;
   abort(id: string): boolean;
@@ -52,15 +57,23 @@ export interface SpawnCapable {
   consumeResult(id: string): boolean;
 }
 
+function sessionIngressTarget(ctx: any): string {
+  const id = ctx?.sessionManager?.getSessionId?.();
+  return typeof id === "string" && id.length > 0 ? `session:${id}` : "session:unknown";
+}
+
+
 export interface RpcDeps {
   events: EventBus;
   pi: unknown;                    // passed through to manager.spawn
   getCtx: () => unknown | undefined;  // returns current ExtensionContext
   manager: SpawnCapable;
+  guardBridgeAdvertisement?: () => unknown;
 }
 
 export interface RpcHandle {
   unsubPing: () => void;
+  unsubGuardBridge: () => void;
   unsubSpawn: () => void;
   unsubStop: () => void;
   unsubConsume: () => void;
@@ -100,11 +113,24 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
   const unsubPing = handleRpc(events, "subagents:rpc:ping", () => {
     return { version: PROTOCOL_VERSION };
   });
+  const unsubGuardBridge = handleRpc(events, "subagents:rpc:guard-bridge", () =>
+    deps.guardBridgeAdvertisement?.() ?? GUARD_BRIDGE_PROTOCOL_ADVERTISEMENT,
+  );
 
   const unsubSpawn = handleRpc<{ requestId: string; type: string; prompt: string; options?: any }>(
     events, "subagents:rpc:spawn", async ({ type, prompt, options }) => {
+      manager.assertGuard?.("cross-extension-rpc.spawn");
       const ctx = getCtx();
       if (!ctx) throw new Error("No active session");
+      await manager.captureIngress?.({
+        rawText: typeof prompt === "string" ? prompt : "",
+        // The RPC schema has no recognized scope-reference field; missing scope stays unresolved.
+        coverage: typeof prompt === "string" ? "partial" : "unknown",
+        target: sessionIngressTarget(ctx),
+        origin: "extension-request",
+        entryPath: "cross-extension-rpc.spawn",
+      });
+
 
       // Cross-extension RPC callers (e.g. pi-tasks TaskExecute) naturally
       // forward serializable values, so options.model can be a string like
@@ -194,5 +220,5 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
     },
   );
 
-  return { unsubPing, unsubSpawn, unsubStop, unsubConsume };
+  return { unsubPing, unsubGuardBridge, unsubSpawn, unsubStop, unsubConsume };
 }

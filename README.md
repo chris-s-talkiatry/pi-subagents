@@ -33,8 +33,8 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Tool denylist** — block specific tools via `disallowed_tools` frontmatter
 - **Styled completion notifications** — background agent results render as themed, compact notification boxes (icon, stats, result preview) instead of raw XML. Expandable to show full output. Group completions render each agent individually
 - **Event bus** — lifecycle events (`subagents:created`, `started`, `completed`, `failed`, `steered`, `compacted`) emitted via `pi.events`, enabling other extensions to react to sub-agent activity
-- **Cross-extension RPC** — other pi extensions can spawn, stop, and join subagents via the `pi.events` event bus (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:consume`). Standardized reply envelopes with protocol versioning. Emits `subagents:ready` on session start. **[Full reference](https://github.com/tintinweb/pi-subagents/blob/master/docs/rpc.md)**
 - **Schedule subagents** — pass `schedule` to the `Agent` tool to fire on cron / interval / one-shot. Session-scoped jobs with PID-locked persistence; results land via the same `subagent-notification` followUp path as manual background completions; manage via `/agents → Scheduled jobs`
+- **Cross-extension RPC** — other pi extensions can spawn, stop, and join subagents via the `pi.events` event bus (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:consume`, and read-only `subagents:rpc:guard-bridge`). Standardized reply envelopes with protocol versioning. Emits `subagents:ready` on session start with `{ guardBridge: … }` advertisement. **[Full reference](https://github.com/tintinweb/pi-subagents/blob/master/docs/rpc.md)**
 - **Model scope enforcement** — opt-in validation that subagent model choices stay within your pi `enabledModels` allowlist (sourced from `/scoped-models`, with both global and project-local pi settings honored). Caller-supplied out-of-scope → hard error to orchestrator; frontmatter-pinned out-of-scope → warning + runs anyway (frontmatter authoritative). Toggle via `/agents → Settings → Scope models`
 
 ## Install
@@ -617,6 +617,10 @@ Runtime tuning values set via `/agents` → Settings (max concurrency, max foreg
 
 **Precedence:** project overrides global on any field present in both. Missing fields fall back to the hardcoded defaults (max concurrency `10`, max foreground concurrency `0` = unlimited, default max turns unlimited, grace turns `5`, nested depth `2`, join mode `smart`, defaults enabled).
 
+**Guard bridge opt-in:** `guardExpected` (default `false`) requires a guard registration before supported subagent work. With `guardExpected: true`, set `guardRegistrant` to the expected non-empty extension id; conflicting global/project ids or a missing id fail closed. These configuration-only keys can be written by hand in `subagents.json`; `/agents` preserves project-owned values without copying global-only ones. Registrant identity prevents accidental/misordered registration, but does not authenticate against a malicious in-process extension—all in-process extensions are trusted code. See the [guard bridge contract](docs/guard-bridge.md).
+
+A present non-boolean `guardExpected` and malformed settings JSON mentioning `guardExpected`/`guardRegistrant` fail closed. An unreadable settings file warns and is ignored rather than turning guarding on; the guard-bridge advertisement exposes `configDiagnostic` and the effective `guardExpected` so a guard requiring opt-in can detect that its expected configuration was not loaded.
+
 **Nested depth** (`maxSubagentDepth`, default `2`): the hard ceiling on [nested delegation](#nested-subagents), counted from the main session (main = 0, its subagents = 1). `0` or `1` disables nesting project-wide regardless of any agent's `allowed_subagents`. Read when a subagent session is built, so a change applies to agents started after it.
 
 **Fallback agent** (`fallbackSubagent`, default `general-purpose`): the agent used when a caller-supplied `subagent_type` doesn't resolve to exactly one enabled agent — unknown, disabled, or ambiguous because two agents differ only by case. Name any enabled agent to route those calls there instead, or set `none` for **strict**, fail-closed dispatch: the call is refused with an error listing the available types, and nothing spawns. Strict mode matters most for background and scheduled calls, which would otherwise start executing a substituted agent before the caller learns anything. Also settable from `/agents → Settings → Fallback agent`. The boolean `false` is accepted as a spelling of `none`, because it would otherwise be dropped as the wrong type and silently leave the permissive default in place. Every other value is read as an agent name, so a mistaken `off` fails loudly at dispatch rather than meaning one thing in the settings file and another in the resolver. A fallback agent that is itself unknown or disabled is a misconfiguration and is reported rather than quietly replaced. Note the default is unchanged and stays permissive by design: with `disableDefaultAgents` and no `general-purpose` of your own, an unresolvable type still resolves to a built-in config carrying *all* tools — set `none` (or name one of your own agents) to close that.
@@ -717,7 +721,7 @@ EOF
 
 Every project now starts with concurrency 16 and grace 10, without ever touching the menu. Individual projects can still override via `/agents` → Settings.
 
-**Failure behavior:** missing file is silent; malformed JSON logs a `[pi-subagents] Ignoring malformed settings at …` warning to stderr; invalid/out-of-range field values are dropped per-field; write failures downgrade the `/agents` toast to a warning with `(session only; failed to persist)`.
+**Failure behavior:** missing file is silent; malformed JSON logs an `Ignoring malformed settings` warning unless it mentions a guard opt-in key (those cases fail closed); unreadable files warn and are ignored without forcing guard enablement; invalid/out-of-range field values are dropped per-field; write failures downgrade the `/agents` toast to a warning with `(session only; failed to persist)`.
 
 ## Events
 
@@ -733,7 +737,7 @@ Agent lifecycle events are emitted via `pi.events.emit()` so other extensions ca
 | `subagents:compacted` | Agent's session successfully compacted | `id`, `type`, `description`, `reason` (`"manual"` / `"threshold"` / `"overflow"`), `tokensBefore`, `compactionCount` |
 | `subagents:scheduled` | Schedule lifecycle change | `{ type: "added" \| "removed" \| "updated" \| "fired" \| "error", … }` (job/agentId/error fields per type) |
 | `subagents:scheduler_ready` | Scheduler bound to session, enabled jobs armed | `sessionId`, `jobCount` |
-| `subagents:ready` | RPC handlers registered and armed — fired on session start; not emitted in a session that excludes pi-subagents | `{}` (empty object) |
+| `subagents:ready` | RPC handlers registered and armed — emitted once on each active session start (including after session switch); not emitted in a session that excludes pi-subagents | `{ guardBridge: { protocol, protocolVersion, outcomes, guardExpected, guardRegistrant, configDiagnostic, registrationRejected?, registrationRejectionHistory?, guardExpectedDiagnostic?, guardRegistrantDiagnostic? } }` |
 | `subagents:settings_loaded` | Persisted settings applied at extension init | `settings` (merged global + project) |
 | `subagents:settings_changed` | `/agents` → Settings mutation was applied | `settings`, `persisted` (`boolean` — `false` on write failure) |
 
@@ -756,12 +760,13 @@ All RPC replies use a standardized envelope: `{ success: true, data?: T }` on su
 Listen for `subagents:ready` to know when RPC handlers are available:
 
 ```typescript
-pi.events.on("subagents:ready", () => {
-  // RPC handlers are registered — safe to call ping/spawn/stop
+pi.events.on("subagents:ready", ({ guardBridge }) => {
+  // RPC handlers are registered; guardBridge advertises the optional guard contract.
+  // Register a guard by emitting subagents:guard:register after this signal.
 });
 ```
 
-`subagents:ready` fires only when pi-subagents is actually loaded **and bound** in the current session. A session that excludes it (via an agent's `extensions:`) emits no `subagents:ready` and does not answer the RPC channels — exactly as if pi-subagents were not installed. Treat "no `subagents:ready`" as "not available here" and give discovery a timeout rather than waiting indefinitely.
+`subagents:ready` fires only when pi-subagents is actually loaded **and bound** in the current session. A session that excludes it (via an agent's `extensions:`) emits no `subagents:ready` and does not answer the RPC channels — exactly as if pi-subagents were not installed. The payload contains a `guardBridge` protocol advertisement; use `subagents:guard:register` after this signal to register, and treat the signal as session-scoped (it is emitted again after `/new` or `/resume`). Give discovery a timeout rather than waiting indefinitely.
 
 ### Ping
 
