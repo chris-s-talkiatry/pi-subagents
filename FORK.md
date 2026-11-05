@@ -8,9 +8,10 @@ extension in the owner's Pi configuration. Initial target runtime: Pi 1.4.0.
 - Package name: `@chris-s-talkiatry/pi-subagents` (deliberately distinct from upstream so stock
   upstream can never silently stand in for it). Its unscoped short name remains `pi-subagents`.
 - Branch `scope-guard-main` carries fork work; releases are immutable git tags `v<upstream>-scope-guard.<n>`.
-- Test artifact version `0.19.0-scope-guard.1` is identified by immutable tag `v0.19.0-scope-guard.1`.
+- Superseding test artifact version `0.19.0-scope-guard.2` is identified by immutable tag `v0.19.0-scope-guard.2`; `.1` remains at its original local tag as a superseded record and is not accepted as the current artifact.
 - Install by tag only, never by branch, via the Pi `git:` package source. Do not patch installed npm files.
 - Guarded child sessions use the v1 `createChildGuardExtension` registration hook; ordinary discovered guard copies can detect the child with `getGuardChildContext(pi.events)` and remain inert, while the returned inline guard factory is loaded last. See `docs/guard-bridge.md` for ordering, failure behavior, and the trusted-extension limitation.
+- Artifact `.2` supersedes `.1` after pre-deployment review found critical guard-off scheduler compatibility and status/filter boundary issues. Guarded capture reports `commit`/`branch` as package-owned only after the same cleanup invocation's `git add -A` received an allowed review; status and staging remain unbounded/reviewed. This ordering is enforced within the fork process and is not cryptographic evidence to another in-process extension.
 
 
 ## Development compatibility limitation
