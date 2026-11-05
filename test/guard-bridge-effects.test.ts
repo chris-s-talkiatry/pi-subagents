@@ -96,6 +96,21 @@ function execResult(overrides: Partial<{ stdout: string; stderr: string; code: n
   return { stdout: "", stderr: "", code: 0, killed: false, ...overrides };
 }
 
+function realGitExec() {
+  return vi.fn(async (command: string, args: string[], options: any) => {
+    try {
+      const stdout = execFileSync(command, args, { cwd: options?.cwd, env: process.env, encoding: "utf8" });
+      return execResult({ stdout });
+    } catch (error: any) {
+      return execResult({
+        stdout: String(error.stdout ?? ""),
+        stderr: String(error.stderr ?? ""),
+        code: typeof error.status === "number" ? error.status : 1,
+      });
+    }
+  });
+}
+
 function temporaryDirectory(prefix: string): string {
   const directory = mkdtempSync(join(tmpdir(), prefix));
   tempDirectories.push(directory);
@@ -112,6 +127,7 @@ function workflowHost(
 }
 
 afterEach(async () => {
+  vi.useRealTimers();
   for (const value of managers) await value.dispose();
   managers.length = 0;
   runnerMocks.runAgent.mockReset();
@@ -551,6 +567,23 @@ function fakeGit(piCalls: Array<{ command: string; args: string[]; options: any 
 }
 
 describe("package-owned worktree effect boundaries", () => {
+  it("does not accept a package-owned bit with an unbounded declaration (N10)", async () => {
+    const captured: GuardEffectRequest[] = [];
+    const guarded = manager(request => { captured.push(request); return "allowed"; });
+    const snapshot = guarded.guardBridgeHost.getResourceEnrollmentSnapshotIdentity()!;
+    await guarded.reviewGuardEffect({
+      kind: "worktree-capture",
+      command: "git",
+      argv: ["add", "-A"],
+      cwd: "/tmp/worktree",
+      envKeys: [],
+      resources: { worktreePath: "/tmp/worktree", branch: "pi-agent-child" },
+      ownedByPackage: true,
+      boundTo: "unbounded",
+    }, { entryPath: "worktree.capture", snapshot });
+    expect(captured[0]).toMatchObject({ ownedByPackage: false, boundTo: "unbounded" });
+  });
+
   it("describes create, capture/commit, and remove with exact owned resources", async () => {
     const captured: GuardEffectRequest[] = [];
     const guarded = manager(request => { captured.push(request); return "allowed"; });
@@ -586,7 +619,7 @@ describe("package-owned worktree effect boundaries", () => {
     expect(add.argv.slice(-5)).toEqual(["worktree", "add", "--detach", worktree!.path, "HEAD"]);
     expect(add.argv).toEqual(expect.arrayContaining([
       "-c", "core.hooksPath=/dev/null", "core.fsmonitor=false", "core.sshCommand=/bin/false",
-      "protocol.allow=never", "commit.gpgsign=false", `--git-dir=${realpathSync(join(repo, ".git"))}`,
+      "protocol.allow=never", "commit.gpgsign=false", "gc.auto=0", "gc.autoDetach=false", "maintenance.auto=false", `--git-dir=${realpathSync(join(repo, ".git"))}`,
       `--work-tree=${realpathSync(repo)}`,
     ]));
     expect(add.envKeys).toContain("GIT_CONFIG_NOSYSTEM");
@@ -594,10 +627,13 @@ describe("package-owned worktree effect boundaries", () => {
     expect(add.envKeys).not.toContain("GIT_DIR");
     const captures = captured.filter(request => request.kind === "worktree-capture");
     expect(captures.length).toBeGreaterThanOrEqual(4);
-    const staging = captures.find(request => request.argv.slice(-2)[0] === "add");
+    const staging = captures.find(request => request.argv.at(-2) === "add");
+    const status = captures.find(request => request.argv.includes("status"));
     expect(staging).toMatchObject({ ownedByPackage: false, boundTo: "unbounded" });
+    expect(status).toMatchObject({ ownedByPackage: false, boundTo: "unbounded" });
+    expect(status?.argv.slice(-4)).toEqual(["status", "--porcelain", "--ignore-submodules=dirty", "--untracked-files=all"]);
     expect(staging?.envKeys).toContain("GIT_CONFIG_NOSYSTEM");
-    const boundedCaptures = captures.filter(request => request !== staging);
+    const boundedCaptures = captures.filter(request => request !== staging && request !== status);
     expect(boundedCaptures.every(request => request.entryPath === "worktree.capture" && request.ownedByPackage && request.boundTo === "owned-resources")).toBe(true);
     expect(captures.every(request => request.cwd === worktree!.path && request.resources.worktreePath === worktree!.path)).toBe(true);
     const remove = captured.find(request => request.kind === "worktree-remove")!;
@@ -616,6 +652,155 @@ describe("package-owned worktree effect boundaries", () => {
     const reviewedArgv = captured.filter(request => request.envKeys.includes("GIT_CONFIG_NOSYSTEM")).map(request => [...request.argv]);
     expect(executedArgv).toEqual(reviewedArgv);
     expect(snapshot).toBeDefined();
+  });
+
+  it("ignores a child-filled submodule while status is reviewed as unbounded (A1)", async () => {
+    const repo = temporaryGitRepo("guard-effect-status-submodule-");
+    const submoduleSource = temporaryGitRepo("guard-effect-status-submodule-source-");
+    execFileSync("git", ["-c", "protocol.file.allow=always", "submodule", "add", "-q", submoduleSource, "sub"], { cwd: repo });
+    execFileSync("git", ["commit", "-q", "-m", "add submodule"], { cwd: repo });
+    const marker = join(temporaryDirectory("guard-effect-submodule-marker-"), "ran");
+    const captured: GuardEffectRequest[] = [];
+    const guarded = manager(request => {
+      captured.push(request);
+      if (request.kind === "worktree-capture" && request.argv.includes("add")) return "denied";
+      return "allowed";
+    });
+    const snapshot = guarded.guardBridgeHost.getResourceEnrollmentSnapshotIdentity()!;
+    const executionLog = installGitArgvLogger();
+    const childId = "effect-child-submodule-status";
+    const hooks: WorktreeEffectHooks = {
+      childId,
+      parentWorkspace: repo,
+      reviewEffect: (effect, entryPath) => guarded.reviewGuardEffect(effect, { entryPath, childId, snapshot }),
+    };
+    const worktree = await createWorktree({ exec: realGitExec() } as any, repo, childId, hooks);
+    expect(worktree).toBeDefined();
+    tempDirectories.push(worktree!.path);
+
+    const sub = join(worktree!.path, "sub");
+    rmSync(sub, { recursive: true, force: true });
+    mkdirSync(sub, { recursive: true });
+    execFileSync("git", ["init", "-q"], { cwd: sub });
+    execFileSync("git", ["config", "user.name", "Child"], { cwd: sub });
+    execFileSync("git", ["config", "user.email", "child@example.invalid"], { cwd: sub });
+    writeFileSync(join(sub, ".gitattributes"), "*.txt filter=owned\n");
+    writeFileSync(join(sub, "victim.txt"), "initial\n");
+    execFileSync("git", ["add", ".gitattributes", "victim.txt"], { cwd: sub });
+    execFileSync("git", ["commit", "-q", "-m", "child repo"], { cwd: sub });
+    const cleaner = join(sub, "clean.sh");
+    writeFileSync(cleaner, `#!/bin/sh\nprintf 'ran\\n' >> '${marker}'\ncat\n`);
+    chmodSync(cleaner, 0o755);
+    execFileSync("git", ["config", "filter.owned.clean", `sh '${cleaner}'`], { cwd: sub });
+    writeFileSync(join(sub, "victim.txt"), "modified\n");
+    writeFileSync(join(worktree!.path, "root-change.txt"), "changed\n");
+
+    await expect(cleanupWorktree({ exec: realGitExec() } as any, repo, worktree!, "submodule child", hooks))
+      .rejects.toMatchObject({ reasonCode: "guard-effect-denied" });
+    const status = captured.find(request => request.kind === "worktree-capture" && request.argv.includes("status"))!;
+    expect(status).toMatchObject({ ownedByPackage: false, boundTo: "unbounded" });
+    expect(status.argv.slice(-4)).toEqual(["status", "--porcelain", "--ignore-submodules=dirty", "--untracked-files=all"]);
+    expect(loggedGitArgv(executionLog).at(-1)).toEqual([...status.argv]);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it("reviews status before a repo-relative child filter can run (A2)", async () => {
+    const repo = temporaryGitRepo("guard-effect-status-filter-");
+    execFileSync("git", ["config", "extensions.worktreeConfig", "true"], { cwd: repo });
+    execFileSync("git", ["config", "--worktree", "filter.owned.clean", "cat"], { cwd: repo });
+    writeFileSync(join(repo, ".gitattributes"), "*.txt filter=owned\n");
+    writeFileSync(join(repo, "victim.txt"), "initial\n");
+    execFileSync("git", ["add", ".gitattributes", "victim.txt"], { cwd: repo });
+    execFileSync("git", ["commit", "-q", "-m", "filter fixture"], { cwd: repo });
+
+    const marker = join(temporaryDirectory("guard-effect-repo-filter-marker-"), "ran");
+    const captured: GuardEffectRequest[] = [];
+    const guarded = manager(request => {
+      captured.push(request);
+      return request.kind === "worktree-capture" && request.argv.includes("status") ? "denied" : "allowed";
+    });
+    const snapshot = guarded.guardBridgeHost.getResourceEnrollmentSnapshotIdentity()!;
+    const executionLog = installGitArgvLogger();
+    const childId = "effect-child-repo-filter";
+    const hooks: WorktreeEffectHooks = {
+      childId,
+      parentWorkspace: repo,
+      reviewEffect: (effect, entryPath) => guarded.reviewGuardEffect(effect, { entryPath, childId, snapshot }),
+    };
+    const worktree = await createWorktree({ exec: realGitExec() } as any, repo, childId, hooks);
+    expect(worktree).toBeDefined();
+    tempDirectories.push(worktree!.path);
+    const cleaner = join(worktree!.path, "clean.sh");
+    writeFileSync(cleaner, `#!/bin/sh\nprintf 'ran\\n' >> '${marker}'\ncat\n`);
+    chmodSync(cleaner, 0o755);
+    execFileSync("git", ["config", "--worktree", "filter.owned.clean", `sh '${cleaner}'`], { cwd: worktree!.path });
+    writeFileSync(join(worktree!.path, "victim.txt"), "modified\n");
+    const callsBeforeCleanup = loggedGitArgv(executionLog).length;
+
+    await expect(cleanupWorktree({ exec: realGitExec() } as any, repo, worktree!, "filter child", hooks))
+      .rejects.toMatchObject({ reasonCode: "guard-effect-denied" });
+    const status = captured.find(request => request.kind === "worktree-capture" && request.argv.includes("status"))!;
+    expect(status).toMatchObject({ ownedByPackage: false, boundTo: "unbounded" });
+    expect(status.readOnly).toBeUndefined();
+    expect(loggedGitArgv(executionLog)).toHaveLength(callsBeforeCleanup);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it("starts a fresh 30-second cleanup command deadline only after UI review completes", async () => {
+    const repo = temporaryGitRepo("guard-effect-command-deadline-");
+    const childId = "effect-child-command-deadline";
+    const setupHooks: WorktreeEffectHooks = {
+      childId,
+      parentWorkspace: repo,
+      reviewEffect: async () => {},
+    };
+    const pi = { exec: realGitExec() } as any;
+    const worktree = await createWorktree(pi, repo, childId, setupHooks);
+    expect(worktree).toBeDefined();
+    tempDirectories.push(worktree!.path);
+
+    const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+    const marker = join(temporaryDirectory("guard-effect-deadline-marker-"), "started");
+    const bin = temporaryDirectory("guard-effect-deadline-bin-");
+    const wrapper = join(bin, "git");
+    writeFileSync(wrapper, `#!/bin/sh\ncase " $* " in *" status "*) printf started > '${marker}'; exec sleep 90;; esac\nexec '${realGit}' "$@"\n`);
+    chmodSync(wrapper, 0o755);
+    process.env.PATH = `${bin}:${previousPath ?? ""}`;
+
+    vi.useFakeTimers();
+    const reviewed: GuardEffectRequest[] = [];
+    let reviewStarted = false;
+    const hooks: WorktreeEffectHooks = {
+      childId,
+      parentWorkspace: repo,
+      reviewEffect: async effect => {
+        reviewed.push(effect as GuardEffectRequest);
+        if (effect.kind === "worktree-capture" && effect.argv.includes("status")) {
+          reviewStarted = true;
+          await new Promise<void>(resolve => setTimeout(resolve, 31_000));
+        }
+      },
+    };
+    let cleanupSettled = false;
+    const cleanup = cleanupWorktree(pi, repo, worktree!, "deadline", hooks).finally(() => { cleanupSettled = true; });
+    await Promise.resolve();
+    expect(reviewStarted).toBe(true);
+    let cleanupError: unknown;
+    const observedCleanup = cleanup.then(() => undefined, error => { cleanupError = error; });
+
+    await vi.advanceTimersByTimeAsync(30_999);
+    expect(existsSync(marker)).toBe(false);
+    expect(cleanupSettled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(() => expect(existsSync(marker)).toBe(true), { timeout: 1000, interval: 10 });
+    expect(cleanupSettled).toBe(false);
+    await vi.advanceTimersByTimeAsync(29_000);
+    expect(cleanupSettled).toBe(false);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await observedCleanup;
+    expect(cleanupSettled).toBe(true);
+    expect(cleanupError).toMatchObject({ reasonCode: "guard-effect-unavailable" });
+    expect(reviewed.some(effect => effect.kind === "worktree-capture" && effect.argv.includes("status"))).toBe(true);
   });
 
   it("denies worktree creation before invoking the concrete git add", async () => {
@@ -687,6 +872,33 @@ describe("package-owned worktree effect boundaries", () => {
       }
     },
   );
+
+  it("rechecks the recorded gitdir after status review and before running git (N4)", async () => {
+    const repo = temporaryGitRepo("guard-effect-post-review-gitdir-");
+    const childId = "effect-child-post-review-gitdir";
+    let worktreePath = "";
+    const hooks: WorktreeEffectHooks = {
+      childId,
+      parentWorkspace: repo,
+      reviewEffect: async effect => {
+        if (effect.kind === "worktree-capture" && effect.argv.includes("status")) {
+          writeFileSync(join(worktreePath, ".git"), "gitdir: ./.attacker-gitdir\n");
+        }
+      },
+    };
+    const pi = { exec: realGitExec() } as any;
+    const worktree = await createWorktree(pi, repo, childId, hooks);
+    expect(worktree).toBeDefined();
+    worktreePath = worktree!.path;
+    tempDirectories.push(worktreePath);
+    // The logger should see cleanup effects only, not the initial worktree setup.
+    const cleanupLog = installGitArgvLogger();
+    writeFileSync(join(worktreePath, "change.txt"), "changed\n");
+
+    await expect(cleanupWorktree(pi, repo, worktree!, "post-review gitdir", hooks))
+      .rejects.toMatchObject({ reasonCode: "guard-effect-unavailable" });
+    expect(loggedGitArgv(cleanupLog)).toEqual([]);
+  });
 
   it("rechecks package ownership after a review changes the reserved worktree path (M2/M14)", async () => {
     const captured: GuardEffectRequest[] = [];
@@ -819,6 +1031,36 @@ describe("package-owned worktree effect boundaries", () => {
       }
       delete process.env.WORKTREE_TEST_HOOK_MARKER;
     }
+  });
+
+  it("does not harden a symlinked worktree path even when its .git pointer names the recorded gitdir (N13)", async () => {
+    const captured: GuardEffectRequest[] = [];
+    const guarded = manager(request => {
+      captured.push(request);
+      return request.kind === "worktree-capture" && request.argv.includes("status") ? "denied" : "allowed";
+    });
+    const snapshot = guarded.guardBridgeHost.getResourceEnrollmentSnapshotIdentity()!;
+    const repo = temporaryGitRepo("guard-effect-symlink-recorded-gitdir-");
+    const pi = { exec: realGitExec() } as any;
+    const childId = "effect-child-symlink-recorded-gitdir";
+    const hooks: WorktreeEffectHooks = {
+      childId,
+      parentWorkspace: repo,
+      reviewEffect: (effect, entryPath) => guarded.reviewGuardEffect(effect, { entryPath, childId, snapshot }),
+    };
+    const worktree = await createWorktree(pi, repo, childId, hooks);
+    expect(worktree).toBeDefined();
+    const outside = temporaryDirectory("guard-effect-symlink-recorded-outside-");
+    rmSync(worktree!.path, { recursive: true, force: true });
+    writeFileSync(join(outside, ".git"), `gitdir: ${worktree!.gitDir}\n`);
+    symlinkSync(outside, worktree!.path);
+    tempDirectories.push(outside);
+
+    await expect(cleanupWorktree(pi, repo, worktree!, "symlink", hooks)).rejects.toMatchObject({ reasonCode: "guard-effect-denied" });
+    const status = captured.find(request => request.kind === "worktree-capture" && request.argv.includes("status"))!;
+    expect(status).toMatchObject({ ownedByPackage: false, boundTo: "unbounded" });
+    expect(status.argv.slice(-4)).toEqual(["status", "--porcelain", "--ignore-submodules=dirty", "--untracked-files=all"]);
+    expect(status.argv.some(argument => argument.startsWith("--git-dir="))).toBe(false);
   });
 
   it("refuses a rewritten worktree .git pointer as unbounded without running its hooks", async () => {

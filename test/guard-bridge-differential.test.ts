@@ -44,7 +44,7 @@ function manager(events: unknown[][]): AgentManager {
     record => events.push(["start", record.description, record.status]),
   );
 }
-function guardedManager(events: unknown[][]): AgentManager {
+function guardedManager(events: unknown[][], reviewEffect: (request: any) => unknown = () => "allowed"): AgentManager {
   const value = manager(events);
   let registration: any;
   registration = {
@@ -69,6 +69,7 @@ function guardedManager(events: unknown[][]): AgentManager {
       approvalSettled: vi.fn(),
       approvalCancelled: vi.fn(),
       approvalExpired: vi.fn(),
+      reviewEffect: vi.fn(reviewEffect),
     },
     createChildGuardExtension: vi.fn(() => vi.fn()),
 
@@ -82,6 +83,7 @@ function guardedManager(events: unknown[][]): AgentManager {
 
 
 afterEach(() => {
+  vi.useRealTimers();
   runnerMocks.runAgent.mockReset();
   runnerMocks.resumeAgent.mockReset();
   worktreeMocks.createWorktree.mockReset();
@@ -248,6 +250,264 @@ describe("guard-off differential against upstream HEAD", () => {
     expect(events).toEqual([["i1", "Error: git exploded", [], [1, 0, 0]]]);
     await m.dispose();
   });
+});
+
+describe("guarded manager scheduled-spawn capability", () => {
+  it("rejects caller-supplied scheduler authority at the manager boundary (N17)", async () => {
+    const m = guardedManager([]);
+    const host = m.guardBridgeHost;
+    expect(() => m.spawn(pi, ctx, "general-purpose", "forged schedule", {
+      description: "forged",
+      guardEntryPath: "scheduled-task.fire",
+      scheduled: { jobId: "forged", runIndex: 1, expiresAt: new Date(Date.now() + 60_000).toISOString() },
+      guardBridgeRegistration: host.getValidatedRegistrationSnapshot(),
+      guardRegistrationSnapshot: host.getResourceEnrollmentSnapshotIdentity(),
+      guardScopeRefStatus: "provided",
+      scopeRef: "forged-scope",
+    } as any)).toThrow(expect.objectContaining({ reasonCode: "guard-effect-unavailable" }));
+    expect(runnerMocks.runAgent).not.toHaveBeenCalled();
+    await m.dispose();
+  });
+});
+
+describe("per-command guarded cleanup review lifetime", () => {
+  const worktree = {
+    path: "/tmp/pi-agent-review-lifetime",
+    branch: "pi-agent-review-lifetime",
+    baseSha: "base",
+    workPath: "/tmp/pi-agent-review-lifetime",
+  };
+  const captureEffect = {
+    kind: "worktree-capture",
+    command: "git",
+    argv: ["status", "--porcelain", "--ignore-submodules=dirty", "--untracked-files=all"],
+    cwd: worktree.path,
+    envKeys: [],
+    resources: { worktreePath: worktree.path, branch: worktree.branch, baseRepo: ctx.cwd, parentWorkspace: ctx.cwd },
+    ownedByPackage: false,
+    boundTo: "unbounded",
+  };
+
+  async function startCleanup(managerValue: AgentManager): Promise<{ id: string; promise: Promise<string> }> {
+    worktreeMocks.createWorktree.mockResolvedValue({ ...worktree });
+    worktreeMocks.cleanupWorktree.mockImplementation(async (_pi: any, _cwd: string, _wt: any, _desc: string, hooks: any) => {
+      await hooks.reviewEffect(captureEffect, "worktree.capture");
+      return { hasChanges: false };
+    });
+    runnerMocks.runAgent.mockImplementation(async (_ctx: any, _type: string, prompt: string, options: any) => {
+      options.onSessionCreated?.(session(prompt));
+      return { responseText: "done", session: session(prompt), aborted: false, steered: false };
+    });
+    const id = managerValue.spawn(pi, ctx, "general-purpose", "cleanup", {
+      description: "review lifetime", isBackground: true, isolation: "worktree",
+    } as any);
+    await managerValue.awaitStartup(id);
+    const promise = managerValue.getRecord(id)!.promise!;
+    for (let index = 0; index < 20; index++) await Promise.resolve();
+    return { id, promise };
+  }
+
+  it("does not consume the UI review wait with the 30-second command deadline", async () => {
+    vi.useFakeTimers();
+    let resolveReview!: (outcome: string) => void;
+    let reviewStarted = false;
+    const events: unknown[][] = [];
+    const m = guardedManager(events, () => {
+      reviewStarted = true;
+      return new Promise<string>(resolve => { resolveReview = resolve; });
+    });
+    m.setHeadless(false);
+    const { id, promise } = await startCleanup(m);
+    let settled = false;
+    void promise.finally(() => { settled = true; });
+    expect(reviewStarted).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(settled).toBe(false);
+    resolveReview("allowed");
+    await promise;
+    expect(settled).toBe(true);
+    expect(m.getRecord(id)?.worktreeCleanupPending).toBeUndefined();
+    await m.dispose();
+  });
+
+  it("keeps headless review bounded at the per-effect review timeout", async () => {
+    vi.useFakeTimers();
+    let reviewStarted = false;
+    const events: unknown[][] = [];
+    const m = guardedManager(events, () => {
+      reviewStarted = true;
+      return new Promise<string>(() => {});
+    });
+    m.setHeadless(true);
+    const { id, promise } = await startCleanup(m);
+    expect(reviewStarted).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    await promise;
+    expect(m.getRecord(id)?.worktreeCleanupPending).toMatchObject({ reason: "guard-effect-unavailable", path: worktree.path, branch: worktree.branch });
+    await m.dispose();
+  });
+});
 
 
+describe("guarded worktree review cancellation and creation lifetime", () => {
+  const creationWorktree = {
+    path: "/tmp/pi-agent-creation-review",
+    branch: "pi-agent-creation-review",
+    baseSha: "base",
+    workPath: "/tmp/pi-agent-creation-review",
+  };
+  const cleanupEffect = {
+    kind: "worktree-capture",
+    command: "git",
+    argv: ["status", "--porcelain", "--ignore-submodules=dirty", "--untracked-files=all"],
+    cwd: creationWorktree.path,
+    envKeys: [],
+    resources: { worktreePath: creationWorktree.path, branch: creationWorktree.branch, baseRepo: ctx.cwd, parentWorkspace: ctx.cwd },
+    ownedByPackage: false,
+    boundTo: "unbounded",
+  };
+  const createEffect = {
+    kind: "worktree-create",
+    command: "git",
+    argv: ["worktree", "add", "--detach", creationWorktree.path, "HEAD"],
+    cwd: ctx.cwd,
+    envKeys: [],
+    resources: { worktreePath: creationWorktree.path, baseRepo: ctx.cwd, parentWorkspace: ctx.cwd, branch: creationWorktree.branch },
+    ownedByPackage: true,
+    boundTo: "owned-resources",
+  };
+
+  async function makeManager(reviewEffect: (request: any) => unknown) {
+    const managerValue = guardedManager([], reviewEffect);
+    managerValue.setHeadless(false);
+    runnerMocks.runAgent.mockImplementation(async (_ctx: any, _type: string, prompt: string, options: any) => {
+      const child = session(prompt);
+      options.onSessionCreated?.(child);
+      return { responseText: "finished", session: child, aborted: false, steered: false };
+    });
+    worktreeMocks.cleanupWorktree.mockResolvedValue({ hasChanges: false });
+    return managerValue;
+  }
+
+  it("does not charge a 30-second command deadline to the worktree-creation UI review", async () => {
+    vi.useFakeTimers();
+    let releaseReview!: (outcome: string) => void;
+    let reviewStarted = false;
+    const m = await makeManager(() => {
+      reviewStarted = true;
+      return new Promise<string>(resolve => { releaseReview = resolve; });
+    });
+    let creationHooks: any;
+    worktreeMocks.createWorktree.mockImplementation(async (_pi: any, _cwd: string, _id: string, hooks: any) => {
+      creationHooks = hooks;
+      await hooks.reviewEffect(createEffect, "worktree.create");
+      return { ...creationWorktree };
+    });
+    const id = m.spawn(pi, ctx, "general-purpose", "creation review", {
+      description: "creation review", isolation: "worktree",
+    } as any);
+    const startup = m.awaitStartup(id);
+    await vi.waitFor(() => expect(reviewStarted).toBe(true));
+
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(m.getRecord(id)?.status).toBe("running");
+    expect(creationHooks.commandSignal).toBeUndefined();
+    expect(worktreeMocks.createWorktree).toHaveBeenCalledTimes(1);
+
+    releaseReview("allowed");
+    await startup;
+    await m.getRecord(id)!.promise;
+    expect(m.getRecord(id)?.status).toBe("completed");
+    await m.dispose();
+  });
+
+  it.each(["stop", "abortAll", "parent"] as const)("cancels a pending cleanup review via %s but records recovery", async stop => {
+    let releaseReview!: (outcome: string) => void;
+    let reviewStarted = false;
+    const m = await makeManager(() => {
+      reviewStarted = true;
+      return new Promise<string>(resolve => { releaseReview = resolve; });
+    });
+    const parent = new AbortController();
+    worktreeMocks.createWorktree.mockResolvedValue({ ...creationWorktree });
+    worktreeMocks.cleanupWorktree.mockImplementation(async (_pi: any, _cwd: string, _wt: any, _desc: string, hooks: any) => {
+      await hooks.reviewEffect(cleanupEffect, "worktree.capture");
+      return { hasChanges: false };
+    });
+    const id = m.spawn(pi, ctx, "general-purpose", "cleanup abort", {
+      description: "cleanup abort", isBackground: true, isolation: "worktree",
+      ...(stop === "parent" ? { signal: parent.signal } : {}),
+    } as any);
+    await m.awaitStartup(id);
+    const record = m.getRecord(id)!;
+    const promise = record.promise!;
+    await vi.waitFor(() => expect(reviewStarted).toBe(true));
+
+    if (stop === "stop") expect(m.abort(id)).toBe(true);
+    else if (stop === "abortAll") expect(m.abortAll()).toBe(1);
+    else parent.abort();
+    await promise;
+    expect(record.worktreeCleanupPending).toMatchObject({ reason: "guard-effect-cancelled", branchCreated: false });
+    expect(record.error).toContain("intended branch");
+    releaseReview("allowed");
+    await m.dispose();
+  });
+
+  it("caps an unresolved UI cleanup review at ten minutes", async () => {
+    vi.useFakeTimers();
+    let reviewStarted = false;
+    const m = await makeManager(() => {
+      reviewStarted = true;
+      return new Promise<string>(() => {});
+    });
+    worktreeMocks.createWorktree.mockResolvedValue({ ...creationWorktree });
+    worktreeMocks.cleanupWorktree.mockImplementation(async (_pi: any, _cwd: string, _wt: any, _desc: string, hooks: any) => {
+      await hooks.reviewEffect(cleanupEffect, "worktree.capture");
+      return { hasChanges: false };
+    });
+    const id = m.spawn(pi, ctx, "general-purpose", "slow cleanup review", {
+      description: "slow cleanup review", isBackground: true, isolation: "worktree",
+    } as any);
+    await m.awaitStartup(id);
+    const promise = m.getRecord(id)!.promise!;
+    await vi.waitFor(() => expect(reviewStarted).toBe(true));
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    await promise;
+    expect(m.getRecord(id)?.worktreeCleanupPending).toMatchObject({ reason: "guard-effect-unavailable" });
+    expect(m.getRecord(id)?.error).toContain("intended branch");
+    await m.dispose();
+  });
+
+  it("does not abort an already-running cleanup command when stopped", async () => {
+    let commandStarted!: () => void;
+    const started = new Promise<void>(resolve => { commandStarted = resolve; });
+    let finishCommand!: () => void;
+    const command = new Promise<void>(resolve => { finishCommand = resolve; });
+    const m = await makeManager(() => "allowed");
+    worktreeMocks.createWorktree.mockResolvedValue({ ...creationWorktree });
+    let commandHooks: any;
+    worktreeMocks.cleanupWorktree.mockImplementation(async (_pi: any, _cwd: string, _wt: any, _desc: string, hooks: any) => {
+      await hooks.reviewEffect(cleanupEffect, "worktree.capture");
+      commandHooks = hooks;
+      commandStarted();
+      await command;
+      return { hasChanges: false };
+    });
+    const id = m.spawn(pi, ctx, "general-purpose", "running cleanup command", {
+      description: "running cleanup command", isBackground: true, isolation: "worktree",
+    } as any);
+    await m.awaitStartup(id);
+    const promise = m.getRecord(id)!.promise!;
+    await started;
+    expect(commandHooks.signal).toBeUndefined();
+    expect(commandHooks.commandSignal).toBeUndefined();
+    expect(m.abort(id)).toBe(true);
+    expect(commandHooks.signal?.aborted).not.toBe(true);
+    finishCommand();
+    await promise;
+    expect(m.getRecord(id)?.worktreeCleanupPending).toBeUndefined();
+    await m.dispose();
+  });
 });

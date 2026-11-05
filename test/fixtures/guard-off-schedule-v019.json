@@ -1,0 +1,271 @@
+{
+  "spawns": [
+    {
+      "type": "general-purpose",
+      "prompt": "once prompt",
+      "options": {
+        "description": "once job",
+        "isBackground": true,
+        "bypassQueue": true,
+        "invocation": {
+          "runInBackground": true
+        }
+      }
+    },
+    {
+      "type": "general-purpose",
+      "prompt": "cron prompt",
+      "options": {
+        "description": "cron job",
+        "isBackground": true,
+        "bypassQueue": true,
+        "invocation": {
+          "runInBackground": true
+        }
+      }
+    },
+    {
+      "type": "general-purpose",
+      "prompt": "error prompt",
+      "options": {
+        "description": "spawn error job",
+        "isBackground": true,
+        "bypassQueue": true,
+        "invocation": {
+          "runInBackground": true
+        }
+      }
+    }
+  ],
+  "events": [
+    {
+      "type": "added",
+      "job": {
+        "id": "ONCE-ID",
+        "name": "once",
+        "description": "once job",
+        "schedule": "2030-01-01T00:00:05.000Z",
+        "scheduleType": "once",
+        "subagent_type": "general-purpose",
+        "prompt": "once prompt",
+        "enabled": true,
+        "createdAt": "2030-01-01T00:00:00.000Z",
+        "runCount": 0
+      }
+    },
+    {
+      "type": "added",
+      "job": {
+        "id": "CRON-ID",
+        "name": "cron",
+        "description": "cron job",
+        "schedule": "0 0 * * * *",
+        "scheduleType": "cron",
+        "subagent_type": "general-purpose",
+        "prompt": "cron prompt",
+        "enabled": true,
+        "createdAt": "2030-01-01T00:00:00.000Z",
+        "runCount": 0
+      }
+    },
+    {
+      "type": "added",
+      "job": {
+        "id": "EXPIRED-ID",
+        "name": "expired",
+        "description": "expired job",
+        "schedule": "1h",
+        "scheduleType": "interval",
+        "intervalMs": 3600000,
+        "subagent_type": "general-purpose",
+        "prompt": "expired prompt",
+        "enabled": true,
+        "createdAt": "2030-01-01T00:00:00.000Z",
+        "runCount": 0
+      }
+    },
+    {
+      "type": "error",
+      "jobId": "EXPIRED-ID",
+      "error": "Scheduled time 2029-12-31T23:59:59.000Z is in the past"
+    },
+    {
+      "type": "updated",
+      "job": {
+        "id": "EXPIRED-ID",
+        "name": "expired",
+        "description": "expired job",
+        "schedule": "2029-12-31T23:59:59.000Z",
+        "scheduleType": "once",
+        "intervalMs": 3600000,
+        "subagent_type": "general-purpose",
+        "prompt": "expired prompt",
+        "enabled": true,
+        "createdAt": "2030-01-01T00:00:00.000Z",
+        "runCount": 0
+      }
+    },
+    {
+      "type": "added",
+      "job": {
+        "id": "DISABLED-ID",
+        "name": "disabled",
+        "description": "disabled job",
+        "schedule": "1h",
+        "scheduleType": "interval",
+        "intervalMs": 3600000,
+        "subagent_type": "general-purpose",
+        "prompt": "disabled prompt",
+        "enabled": true,
+        "createdAt": "2030-01-01T00:00:00.000Z",
+        "runCount": 0
+      }
+    },
+    {
+      "type": "updated",
+      "job": {
+        "id": "DISABLED-ID",
+        "name": "disabled",
+        "description": "disabled job",
+        "schedule": "1h",
+        "scheduleType": "interval",
+        "intervalMs": 3600000,
+        "subagent_type": "general-purpose",
+        "prompt": "disabled prompt",
+        "enabled": false,
+        "createdAt": "2030-01-01T00:00:00.000Z",
+        "runCount": 0
+      }
+    },
+    {
+      "type": "added",
+      "job": {
+        "id": "ERROR-ID",
+        "name": "spawn-error",
+        "description": "spawn error job",
+        "schedule": "1h",
+        "scheduleType": "interval",
+        "intervalMs": 3600000,
+        "subagent_type": "missing-agent-type",
+        "prompt": "error prompt",
+        "enabled": true,
+        "createdAt": "2030-01-01T00:00:00.000Z",
+        "runCount": 0
+      }
+    },
+    {
+      "type": "fired",
+      "jobId": "ONCE-ID",
+      "agentId": "AGENT-ID",
+      "name": "once"
+    },
+    {
+      "type": "updated",
+      "job": {
+        "id": "ONCE-ID",
+        "name": "once",
+        "description": "once job",
+        "schedule": "2030-01-01T00:00:05.000Z",
+        "scheduleType": "once",
+        "subagent_type": "general-purpose",
+        "prompt": "once prompt",
+        "enabled": false,
+        "createdAt": "2030-01-01T00:00:00.000Z",
+        "runCount": 0,
+        "lastStatus": "running"
+      }
+    },
+    {
+      "type": "fired",
+      "jobId": "CRON-ID",
+      "agentId": "AGENT-ID",
+      "name": "cron"
+    },
+    {
+      "type": "error",
+      "jobId": "ERROR-ID",
+      "error": "spawn failed"
+    }
+  ],
+  "jobs": [
+    {
+      "id": "ONCE-ID",
+      "name": "once",
+      "description": "once job",
+      "schedule": "2030-01-01T00:00:05.000Z",
+      "scheduleType": "once",
+      "subagent_type": "general-purpose",
+      "prompt": "once prompt",
+      "enabled": false,
+      "createdAt": "2030-01-01T00:00:00.000Z",
+      "runCount": 1,
+      "lastStatus": "success",
+      "lastRun": "2030-01-01T00:00:05.000Z"
+    },
+    {
+      "id": "CRON-ID",
+      "name": "cron",
+      "description": "cron job",
+      "schedule": "0 0 * * * *",
+      "scheduleType": "cron",
+      "subagent_type": "general-purpose",
+      "prompt": "cron prompt",
+      "enabled": true,
+      "createdAt": "2030-01-01T00:00:00.000Z",
+      "runCount": 1,
+      "lastStatus": "success",
+      "lastRun": "2030-01-01T00:00:05.100Z",
+      "nextRun": "2030-01-01T01:00:00.000Z"
+    },
+    {
+      "id": "EXPIRED-ID",
+      "name": "expired",
+      "description": "expired job",
+      "schedule": "2029-12-31T23:59:59.000Z",
+      "scheduleType": "once",
+      "intervalMs": 3600000,
+      "subagent_type": "general-purpose",
+      "prompt": "expired prompt",
+      "enabled": false,
+      "createdAt": "2030-01-01T00:00:00.000Z",
+      "runCount": 0,
+      "lastStatus": "error"
+    },
+    {
+      "id": "DISABLED-ID",
+      "name": "disabled",
+      "description": "disabled job",
+      "schedule": "1h",
+      "scheduleType": "interval",
+      "intervalMs": 3600000,
+      "subagent_type": "general-purpose",
+      "prompt": "disabled prompt",
+      "enabled": false,
+      "createdAt": "2030-01-01T00:00:00.000Z",
+      "runCount": 0
+    },
+    {
+      "id": "ERROR-ID",
+      "name": "spawn-error",
+      "description": "spawn error job",
+      "schedule": "1h",
+      "scheduleType": "interval",
+      "intervalMs": 3600000,
+      "subagent_type": "missing-agent-type",
+      "prompt": "error prompt",
+      "enabled": true,
+      "createdAt": "2030-01-01T00:00:00.000Z",
+      "runCount": 0,
+      "lastStatus": "error",
+      "lastRun": "2030-01-01T00:00:05.050Z"
+    }
+  ],
+  "bytes": "{\n  \"version\": 1,\n  \"jobs\": [\n    {\n      \"id\": \"ONCE-ID\",\n      \"name\": \"once\",\n      \"description\": \"once job\",\n      \"schedule\": \"2030-01-01T00:00:05.000Z\",\n      \"scheduleType\": \"once\",\n      \"subagent_type\": \"general-purpose\",\n      \"prompt\": \"once prompt\",\n      \"enabled\": false,\n      \"createdAt\": \"2030-01-01T00:00:00.000Z\",\n      \"runCount\": 1,\n      \"lastStatus\": \"success\",\n      \"lastRun\": \"2030-01-01T00:00:05.000Z\"\n    },\n    {\n      \"id\": \"CRON-ID\",\n      \"name\": \"cron\",\n      \"description\": \"cron job\",\n      \"schedule\": \"0 0 * * * *\",\n      \"scheduleType\": \"cron\",\n      \"subagent_type\": \"general-purpose\",\n      \"prompt\": \"cron prompt\",\n      \"enabled\": true,\n      \"createdAt\": \"2030-01-01T00:00:00.000Z\",\n      \"runCount\": 1,\n      \"lastStatus\": \"success\",\n      \"lastRun\": \"2030-01-01T00:00:05.100Z\",\n      \"nextRun\": \"2030-01-01T01:00:00.000Z\"\n    },\n    {\n      \"id\": \"EXPIRED-ID\",\n      \"name\": \"expired\",\n      \"description\": \"expired job\",\n      \"schedule\": \"2029-12-31T23:59:59.000Z\",\n      \"scheduleType\": \"once\",\n      \"intervalMs\": 3600000,\n      \"subagent_type\": \"general-purpose\",\n      \"prompt\": \"expired prompt\",\n      \"enabled\": false,\n      \"createdAt\": \"2030-01-01T00:00:00.000Z\",\n      \"runCount\": 0,\n      \"lastStatus\": \"error\"\n    },\n    {\n      \"id\": \"DISABLED-ID\",\n      \"name\": \"disabled\",\n      \"description\": \"disabled job\",\n      \"schedule\": \"1h\",\n      \"scheduleType\": \"interval\",\n      \"intervalMs\": 3600000,\n      \"subagent_type\": \"general-purpose\",\n      \"prompt\": \"disabled prompt\",\n      \"enabled\": false,\n      \"createdAt\": \"2030-01-01T00:00:00.000Z\",\n      \"runCount\": 0\n    },\n    {\n      \"id\": \"ERROR-ID\",\n      \"name\": \"spawn-error\",\n      \"description\": \"spawn error job\",\n      \"schedule\": \"1h\",\n      \"scheduleType\": \"interval\",\n      \"intervalMs\": 3600000,\n      \"subagent_type\": \"missing-agent-type\",\n      \"prompt\": \"error prompt\",\n      \"enabled\": true,\n      \"createdAt\": \"2030-01-01T00:00:00.000Z\",\n      \"runCount\": 0,\n      \"lastStatus\": \"error\",\n      \"lastRun\": \"2030-01-01T00:00:05.050Z\"\n    }\n  ]\n}",
+  "nextRuns": {
+    "once": null,
+    "cron": "2030-01-01T01:00:00.000Z",
+    "expired": null,
+    "disabled": null,
+    "spawn-error": "2030-01-01T01:00:05.050Z"
+  }
+}

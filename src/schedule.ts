@@ -404,7 +404,9 @@ export class SubagentScheduler {
     if (!store || !pi || !ctx || !manager) return;
     let job = store.get(id);
     if (!job?.enabled) return;
-    const guarded = manager.guardBridgeHost?.guardExpected === true;
+    const guardHost = manager.guardBridgeHost;
+    const guarded = guardHost?.guardExpected === true;
+    const guardedRegistrationActive = guarded && guardHost?.getValidatedRegistrationSnapshot() !== undefined;
     let runIndex: number | undefined;
     let localScope = false;
     if (guarded) {
@@ -492,11 +494,11 @@ export class SubagentScheduler {
       if (!dispatch.ok) throw new Error(dispatch.message);
       const provenance = localScope ? this.creationProvenance.get(job.id) : undefined;
 
-      if (guarded && typeof manager.spawnScheduled !== "function") throw scheduleScopeFailure();
+      if (guardedRegistrationActive && typeof manager.spawnScheduled !== "function") throw scheduleScopeFailure();
       const spawnOptions = {
         description: job.description,
-        guardEntryPath: "scheduled-task.fire" as const,
-        ...(guarded ? {
+        ...(guardedRegistrationActive ? {
+          guardEntryPath: "scheduled-task.fire" as const,
           ...(provenance?.ingressId ? { guardIngressId: provenance.ingressId } : {}),
           guardOrigin: localScope ? provenance?.origin ?? "parent-model-delegation" : "imported-context",
           scopeRef: this.guardedJobSnapshots.get(job.id)?.scopeId ?? job.guardScopeId,
@@ -530,7 +532,7 @@ export class SubagentScheduler {
           isolation: job.isolation,
         },
       };
-      agentId = guarded
+      agentId = guardedRegistrationActive
         ? manager.spawnScheduled(pi, ctx, dispatch.type, job.prompt, spawnOptions)
         : manager.spawn(pi, ctx, dispatch.type, job.prompt, spawnOptions);
     } catch (err) {

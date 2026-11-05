@@ -55,6 +55,19 @@ export type CompactionInfo = { reason: "manual" | "threshold" | "overflow"; toke
  */
 const DEFAULT_MAX_CONCURRENT = 10;
 
+function recordWorktreeCleanupPending(record: AgentRecord, worktree: NonNullable<AgentRecord["worktree"]>, error: unknown): void {
+  const reason = error instanceof GuardBridgeRejection ? error.reasonCode : "cleanup-failed";
+  const pending = {
+    path: worktree.path.slice(0, 4096),
+    branch: worktree.branch.slice(0, 256),
+    branchCreated: worktree.branchCreated === true,
+    reason: reason.slice(0, 96),
+  };
+  record.worktreeCleanupPending = pending;
+  const note = `Worktree cleanup pending (${pending.reason}) at ${pending.path}; intended branch ${pending.branch} (created: ${pending.branchCreated ? "yes" : "no"}).`;
+  record.error = [record.error, note].filter(Boolean).join("; ").slice(0, 2048);
+}
+
 /**
  * Default max concurrent foreground (blocking) agents — `0` = unlimited, the
  * extension's existing convention for "no ceiling" (`defaultMaxTurns`).
@@ -371,6 +384,8 @@ interface ResumeOptions {
 
 /** Best-effort ceiling on one child's shutdown handlers, so teardown can't strand a quit. */
 const CHILD_SHUTDOWN_TIMEOUT_MS = 3_000;
+/** Maximum UI wait for one guarded worktree cleanup review before recovery coordinates are recorded. */
+const WORKTREE_REVIEW_TIMEOUT_MS = 10 * 60_000;
 
 /**
  * Close the extension lifecycle `runAgent` opened with `bindExtensions`, then dispose.
@@ -615,7 +630,13 @@ export class AgentManager {
 
   private disposed = false;
   private readonly scheduledSpawnCapability = Object.freeze({});
+  /** Creation review/lifetime signals retained until createWorktree settles. */
   private worktreeLifetimeControllers = new Set<AbortController>();
+  /** Active cleanup reviews, cancellable without interrupting an in-flight Git command. */
+  private worktreeReviewControllers = new Set<AbortController>();
+  private activeWorktreeReviewControllers = new Map<string, AbortController>();
+  private activeWorktreeCleanups = new Set<string>();
+  private cancelledWorktreeCleanups = new Set<string>();
 
   private agents = new Map<string, AgentRecord>();
   private guardEffectSnapshots = new WeakMap<AgentRecord, object>();
@@ -756,6 +777,9 @@ export class AgentManager {
     prompt: string,
     options: SpawnOptions,
   ): string {
+    if (!this.guardBridgeHost.guardExpected || this.guardBridgeHost.getValidatedRegistrationSnapshot() === undefined) {
+      return this.spawn(pi, ctx, type, prompt, options);
+    }
     return this.spawn(pi, ctx, type, prompt, {
       ...options,
       guardEntryPath: "scheduled-task.fire",
@@ -770,8 +794,13 @@ export class AgentManager {
     prompt: string,
     options: SpawnOptions,
   ): string {
+    const guardedRegistrationActive = this.guardBridgeHost.guardExpected &&
+      this.guardBridgeHost.getValidatedRegistrationSnapshot() !== undefined;
+
     const internalScheduledSpawn = options[INTERNAL_SCHEDULED_SPAWN] === this.scheduledSpawnCapability;
-    if ((options.scheduled !== undefined || options.guardEntryPath === "scheduled-task.fire") && !internalScheduledSpawn) {
+    // The following gate rejects every caller-supplied scheduled payload unless
+    // it carries this manager-local capability.
+    if (guardedRegistrationActive && (options.scheduled !== undefined || options.guardEntryPath === "scheduled-task.fire") && !internalScheduledSpawn) {
       throw new GuardBridgeRejection(
         "guard-effect-unavailable", "scheduled-task.fire",
         "guard-effect-unavailable: guarded work is unavailable at scheduled-task.fire; only the scheduler may fire a scheduled child.",
@@ -1075,7 +1104,7 @@ export class AgentManager {
       detach();
       releaseSlot();
       if (record.blocking) record.resultConsumed = true;
-      this.drainQueue();
+      if (!this.disposed) this.drainQueue();
       try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
     };
 
@@ -1170,42 +1199,81 @@ export class AgentManager {
       reviewEffect: effectReviewer,
       assertSnapshotActive: effectEntryPath => this.assertGuardEffectSnapshotActive(args.options.guardRegistrationSnapshot, effectEntryPath),
     } : undefined;
-    const createWorktreeLifetime = (): { signal: AbortSignal; release: () => void } => {
-      const controller = new AbortController();
-      this.worktreeLifetimeControllers.add(controller);
-      const timeout = setTimeout(() => controller.abort(), 30_000);
-      timeout.unref?.();
-      return {
-        signal: controller.signal,
-        release: () => {
-          clearTimeout(timeout);
-          this.worktreeLifetimeControllers.delete(controller);
-        },
-      };
-    };
     const createCleanupHooks = (): { hooks?: WorktreeEffectHooks; release: () => void } => {
       if (!worktreeHooks || !effectReviewer) return { release: () => {} };
-      const lifetime = createWorktreeLifetime();
+      // Abort cancels an active review only. Git commands use their own deadline
+      // and are deliberately not linked to the child signal, so commit cannot be
+      // interrupted halfway through by Stop, Esc, abortAll, or a parent abort.
+      this.activeWorktreeCleanups.add(id);
       return {
         hooks: {
           ...worktreeHooks,
-          signal: lifetime.signal,
-          reviewEffect: (effect, entryPath) => effectReviewer(effect, entryPath, lifetime.signal),
+          signal: undefined,
+          commandSignal: undefined,
+          reviewEffect: async (effect, entryPath) => {
+            if (this.cancelledWorktreeCleanups.has(id)) {
+              throw new GuardBridgeRejection(
+                "guard-effect-cancelled", entryPath,
+                `guard-effect-cancelled: guarded work is unavailable at ${entryPath}; cleanup review was cancelled before execution.`,
+              );
+            }
+            const reviewController = new AbortController();
+            this.worktreeReviewControllers.add(reviewController);
+            this.activeWorktreeReviewControllers.set(id, reviewController);
+            let reviewTimedOut = false;
+            const reviewTimer = setTimeout(() => {
+              reviewTimedOut = true;
+              reviewController.abort();
+            }, WORKTREE_REVIEW_TIMEOUT_MS);
+            reviewTimer.unref?.();
+            try {
+              const outcome = await raceWithAbort(
+                effectReviewer(effect, entryPath, reviewController.signal),
+                reviewController.signal,
+              );
+              if (reviewTimedOut) {
+                throw new GuardBridgeRejection(
+                  "guard-effect-unavailable", entryPath,
+                  `guard-effect-unavailable: guarded work is unavailable at ${entryPath}; cleanup review exceeded its 10-minute limit.`,
+                );
+              }
+              if (outcome.aborted) {
+                throw new GuardBridgeRejection(
+                  "guard-effect-cancelled", entryPath,
+                  `guard-effect-cancelled: guarded work is unavailable at ${entryPath}; cleanup review was cancelled before execution.`,
+                );
+              }
+            } finally {
+              clearTimeout(reviewTimer);
+              this.worktreeReviewControllers.delete(reviewController);
+              if (this.activeWorktreeReviewControllers.get(id) === reviewController) this.activeWorktreeReviewControllers.delete(id);
+            }
+          },
         },
-        release: lifetime.release,
+        release: () => {
+          this.activeWorktreeCleanups.delete(id);
+          this.cancelledWorktreeCleanups.delete(id);
+        },
       };
     };
 
     let worktreeCwd: string | undefined;
     if (options.isolation === "worktree" && isWorktreeIsolationEnabled()) {
       let wt: Awaited<ReturnType<typeof createWorktree>>;
-      const creationLifetime = worktreeHooks ? createWorktreeLifetime() : undefined;
+      // Review can take as long as the UI needs. Each Git command starts its
+      // own 30-second deadline only after its review has completed.
+      const creationController = worktreeHooks ? record.abortController! : undefined;
+      if (creationController) this.worktreeLifetimeControllers.add(creationController);
       try {
         wt = worktreeHooks
-          ? await createWorktree(pi, baseCwd, id, { ...worktreeHooks, commandSignal: creationLifetime!.signal })
+          ? await createWorktree(pi, baseCwd, id, worktreeHooks)
           : await createWorktree(pi, baseCwd, id);
       } catch (err) {
-        if (guardedContextRequired && record.status !== "running") {
+        if (this.disposed || guardedContextRequired && record.status !== "running") {
+          if (record.status === "running") {
+            record.status = "stopped";
+            record.completedAt = Date.now();
+          }
           record.error = err instanceof Error ? err.message.slice(0, 512) : "Worktree creation stopped.";
           finishAbortedContextStartup();
           return;
@@ -1216,10 +1284,18 @@ export class AgentManager {
         }
         throw err;
       } finally {
-        creationLifetime?.release();
+        if (creationController) this.worktreeLifetimeControllers.delete(creationController);
+      }
+      if (this.disposed && record.status === "running") {
+        record.status = "stopped";
+        record.completedAt = Date.now();
       }
       if (!wt) {
-        if (guardedContextRequired && record.status !== "running") {
+        if (this.disposed || record.status !== "running") {
+          if (record.status === "running") {
+            record.status = "stopped";
+            record.completedAt = Date.now();
+          }
           finishAbortedContextStartup();
           return;
         }
@@ -1257,8 +1333,9 @@ export class AgentManager {
         try {
           record.worktreeResult = await cleanupWorktree(pi, baseCwd, wt, options.description, cleanup.hooks);
         } catch (error) {
-          const reason = error instanceof Error ? error.message.slice(0, 256) : "guarded worktree cleanup was denied";
-          record.error = `Worktree cleanup incomplete: ${reason}`;
+          if (guardedContextRequired && this.guardBridgeHost.guardExpected && registration !== undefined) {
+            recordWorktreeCleanupPending(record, wt, error);
+          }
         } finally {
           cleanup.release();
           finishAbortedContextStartup();
@@ -1402,8 +1479,8 @@ export class AgentManager {
         record.structuredRetried = structuredRetried;
         record.session = session;
         record.completedAt ??= Date.now();
+        if (!guardedContextRequired) detach();
 
-        detach();
 
         // Final flush of streaming output file
         if (record.outputCleanup) {
@@ -1429,8 +1506,9 @@ export class AgentManager {
             record.worktreeResult = wtResult;
           } catch (error) {
             if (!worktreeHooks) throw error;
-            const reason = error instanceof Error ? error.message.slice(0, 256) : "guarded worktree cleanup was denied";
-            record.error = [record.error, `Worktree cleanup incomplete: ${reason}`].filter(Boolean).join("; ").slice(0, 1024);
+            if (guardedContextRequired && this.guardBridgeHost.guardExpected && registration !== undefined) {
+              recordWorktreeCleanupPending(record, record.worktree, error);
+            }
           } finally {
             cleanup.release();
           }
@@ -1446,6 +1524,7 @@ export class AgentManager {
           }
         }
 
+        detach();
         this.abortOwnedChildren(id);
 
         this.settleRun(record, true, pool);
@@ -1458,8 +1537,8 @@ export class AgentManager {
         }
         record.error = err instanceof Error ? err.message : String(err);
         record.completedAt ??= Date.now();
+        if (!guardedContextRequired) detach();
 
-        detach();
 
         // Final flush of streaming output file on error
         if (record.outputCleanup) {
@@ -1476,13 +1555,15 @@ export class AgentManager {
               : await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
             record.worktreeResult = wtResult;
           } catch (error) {
-            const reason = error instanceof Error ? error.message.slice(0, 256) : "guarded worktree cleanup was denied";
-            record.error = [record.error, `Worktree cleanup incomplete: ${reason}`].filter(Boolean).join("; ").slice(0, 1024);
+            if (guardedContextRequired && this.guardBridgeHost.guardExpected && registration !== undefined) {
+              recordWorktreeCleanupPending(record, record.worktree, error);
+            }
           } finally {
             cleanup.release();
           }
         }
 
+        detach();
         this.abortOwnedChildren(id);
 
         this.settleRun(record, false, pool);
@@ -2234,7 +2315,12 @@ export class AgentManager {
       return true;
     }
 
-    if (record.status !== "running") return false;
+    if (record.status !== "running") {
+      if (!this.activeWorktreeCleanups.has(id)) return false;
+      this.cancelledWorktreeCleanups.add(id);
+      this.activeWorktreeReviewControllers.get(id)?.abort();
+      return true;
+    }
     record.abortController?.abort();
     record.status = "stopped";
     record.completedAt = Date.now();
@@ -2340,6 +2426,10 @@ export class AgentManager {
         record.status = "stopped";
         record.completedAt = Date.now();
         count++;
+      } else if (this.activeWorktreeCleanups.has(record.id)) {
+        this.cancelledWorktreeCleanups.add(record.id);
+        this.activeWorktreeReviewControllers.get(record.id)?.abort();
+        count++;
       }
     }
     return count;
@@ -2375,6 +2465,18 @@ export class AgentManager {
     clearInterval(this.cleanupInterval);
     for (const controller of this.worktreeLifetimeControllers) controller.abort();
     this.worktreeLifetimeControllers.clear();
+    for (const controller of this.worktreeReviewControllers) controller.abort();
+    this.worktreeReviewControllers.clear();
+    for (const record of this.agents.values()) {
+      if (record.status === "running") {
+        record.abortController?.abort();
+        record.status = "stopped";
+        record.completedAt ??= Date.now();
+      } else if (record.status === "queued") {
+        record.status = "stopped";
+        record.completedAt ??= Date.now();
+      }
+    }
     // Clear queue — via dequeue, so anyone blocked in spawnAndWait is woken
     // rather than left awaiting a gate nothing will ever resolve.
     this.dequeue(() => true);

@@ -221,6 +221,10 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showC
   // did not ask for is a figure it may start reporting unprompted.
   const cost = showCost ? getLifetimeCost(record.lifetimeUsage) : 0;
   const costXml = cost > 0 ? `<estimated_cost_usd>${cost.toFixed(4)}</estimated_cost_usd>` : "";
+  const cleanupPending = record.worktreeCleanupPending;
+  const cleanupPendingXml = cleanupPending
+    ? `<worktree-cleanup-pending><path>${escapeXml(cleanupPending.path)}</path><branch>${escapeXml(cleanupPending.branch)}</branch><branch-created>${cleanupPending.branchCreated ? "true" : "false"}</branch-created><reason>${escapeXml(cleanupPending.reason)}</reason></worktree-cleanup-pending>`
+    : null;
 
   const resultPreview = record.result
     ? record.result.length > resultMaxLen
@@ -236,6 +240,7 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showC
     `<status>${escapeXml(status)}</status>`,
     `<summary>Agent "${escapeXml(record.description)}" ${record.status}${getStatusNote(record.status)}</summary>`,
     `<result>${escapeXml(resultPreview)}</result>`,
+    cleanupPendingXml,
     `<usage><total_tokens>${totalTokens}</total_tokens><tool_uses>${record.toolUses}</tool_uses>${ctxXml}${compactXml}${costXml}<duration_ms>${durationMs}</duration_ms></usage>`,
     `</task-notification>`,
   ].filter(Boolean).join('\n');
@@ -244,7 +249,7 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showC
 /** Build AgentDetails from a base + record-specific fields. */
 function buildDetails(
   base: Pick<AgentDetails, "displayName" | "description" | "subagentType" | "modelName" | "tags">,
-  record: { toolUses: number; startedAt: number; completedAt?: number; status: string; error?: string; id?: string; session?: any; lifetimeUsage: LifetimeUsage },
+  record: { toolUses: number; startedAt: number; completedAt?: number; status: string; error?: string; id?: string; session?: any; lifetimeUsage: LifetimeUsage; worktreeCleanupPending?: AgentRecord["worktreeCleanupPending"] },
   activity?: AgentActivity,
   overrides?: Partial<AgentDetails>,
 ): AgentDetails {
@@ -262,6 +267,7 @@ function buildDetails(
     status: record.status as AgentDetails["status"],
     agentId: record.id,
     error: record.error,
+    ...(record.worktreeCleanupPending ? { worktreeCleanupPending: record.worktreeCleanupPending } : {}),
     ...overrides,
   };
 }
@@ -285,6 +291,7 @@ function buildNotificationDetails(record: AgentRecord, resultMaxLen: number, act
     durationMs: record.completedAt ? record.completedAt - record.startedAt : 0,
     outputFile: record.outputFile,
     error: record.error,
+    ...(record.worktreeCleanupPending ? { worktreeCleanupPending: record.worktreeCleanupPending } : {}),
     resultPreview: record.result
       ? record.result.length > resultMaxLen
         ? record.result.slice(0, resultMaxLen) + "…"
@@ -598,6 +605,7 @@ export default function (pi: ExtensionAPI) {
       description: record.description,
       result: record.result,
       error: record.error,
+      ...(record.worktreeCleanupPending ? { worktreeCleanupPending: record.worktreeCleanupPending } : {}),
       status: record.status,
       toolUses: record.toolUses,
       durationMs,
@@ -627,6 +635,7 @@ export default function (pi: ExtensionAPI) {
     pi.appendEntry("subagents:record", {
       id: record.id, type: record.type, description: record.description,
       status: record.status, result: record.result, error: record.error,
+      ...(record.worktreeCleanupPending ? { worktreeCleanupPending: record.worktreeCleanupPending } : {}),
       startedAt: record.startedAt, completedAt: record.completedAt,
     });
 
@@ -2651,7 +2660,10 @@ Terse command-style prompts produce shallow, generic work.
       }
       return textResult(
         `${fallbackNote}Agent completed in ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status)}.\n\n` +
-        (record.result?.trim() || "No output."),
+        (record.result?.trim() || "No output.") +
+          (record.worktreeCleanupPending
+            ? `\n\nWorktree cleanup pending at ${record.worktreeCleanupPending.path}. Intended branch: ${record.worktreeCleanupPending.branch} (created: ${record.worktreeCleanupPending.branchCreated ? "yes" : "no"}); reason: ${record.worktreeCleanupPending.reason}.`
+            : ""),
         details,
       );
     },

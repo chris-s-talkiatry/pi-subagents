@@ -29,6 +29,8 @@ export interface WorktreeInfo {
   baseSha: string;
   /** Recorded administrative gitdir, when created on a guarded path. */
   gitDir?: string;
+  /** Whether guarded cleanup successfully created the intended branch. */
+  branchCreated?: boolean;
   /**
    * Where the agent should work inside the worktree: the equivalent of the
    * cwd the worktree was created from. Equals `path` when that cwd was the
@@ -111,7 +113,19 @@ function worktreeGitDirMatches(owner: OwnedWorktree): boolean {
     const pointer = readFileSync(join(owner.path, ".git"), "utf8").match(/^gitdir:\s*(.+?)\s*$/m)?.[1];
     if (!pointer) return false;
     const actual = realpathSync(isAbsolute(pointer) ? pointer : resolve(owner.path, pointer));
-    return actual === owner.gitDir;
+    if (actual !== owner.gitDir) return false;
+    const commonLine = readFileSync(join(actual, "commondir"), "utf8").trim();
+    const actualCommon = realpathSync(isAbsolute(commonLine) ? commonLine : resolve(actual, commonLine));
+    return actualCommon === owner.commonGitDir;
+  } catch {
+    return false;
+  }
+}
+
+function safeWorktreeHeadMatches(owner: OwnedWorktree): boolean {
+  try {
+    const head = readFileSync(join(owner.gitDir, "HEAD"), "utf8").trim();
+    return head === `ref: refs/heads/${owner.branch}` || /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(head);
   } catch {
     return false;
   }
@@ -140,6 +154,9 @@ const HARDENED_GIT_ARGS = [
   "-c", "core.sshCommand=/bin/false",
   "-c", "protocol.allow=never",
   "-c", "commit.gpgsign=false",
+  "-c", "gc.auto=0",
+  "-c", "gc.autoDetach=false",
+  "-c", "maintenance.auto=false",
 ] as const;
 
 function hardenedEnvironment(): NodeJS.ProcessEnv {
@@ -244,11 +261,14 @@ function canHardenCommand(
       args[2] === "--detach" && args[3] === owner.path && args[4] === "HEAD" &&
       !existsSync(owner.path) && owner.branch === `pi-agent-${owner.childId}`;
   }
-  if (!owner.created || !worktreeGitDirMatches(owner)) return false;
+  if (!owner.created || !worktreeGitDirMatches(owner) || !safeWorktreeHeadMatches(owner)) return false;
   if (kind === "worktree-capture") {
     if (!sameOwnedWorktree(cwd, owner)) return false;
-    if (args[0] === "status") return args.length === 2 && args[1] === "--porcelain";
+    if (args[0] === "status") return args.length === 4 && args[1] === "--porcelain" &&
+      args[2] === "--ignore-submodules=dirty" && args[3] === "--untracked-files=all";
     if (args[0] === "add") return args.length === 2 && args[1] === "-A";
+    // git() is private and cleanupWorktree is its only commit caller; that call
+    // constructs fixed argv, with only the bounded description as the message.
     if (args[0] === "commit") return args.length === 4 && args[1] === "--no-verify" && args[2] === "-m";
     if (args[0] === "rev-parse") return args.length === 2 && args[1] === "HEAD";
     if (args[0] === "branch") return args.length === 2 && typeof args[1] === "string" && args[1].length > 0;
@@ -274,11 +294,27 @@ function packageOwnsCommand(
   declaredBranch?: string,
 ): boolean {
   if (!canHardenCommand(kind, command, args, cwd, owner, hooks)) return false;
-  // `git add` can invoke child-selected clean filters from .gitattributes and
-  // local filter config; hardening prevents hooks but cannot bound those filters.
-  if (kind === "worktree-capture" && args[0] === "add") return false;
+  // Status and staging invoke repository-/child-selected filters, so neither is
+  // package-owned. Commit and branch require a successful stage review from this
+  // exact cleanup invocation for this same worktree.
+  if (kind === "worktree-capture" && (args[0] === "add" || args[0] === "status")) return false;
+  if (kind === "worktree-capture" && (args[0] === "commit" || args[0] === "branch")) {
+    const approval = hooks ? cleanupSessionApprovals.get(hooks) : undefined;
+    if (!owner || approval?.stagedWorktreePath !== owner.path) return false;
+  }
+  // Prune changes the repository-wide worktree registry, including the
+  // removeWorktree fallback, so it is never bounded to one child resource.
+  if (kind === "worktree-prune") return false;
   return declaredBranch === undefined || declaredBranch === owner?.branch;
 }
+interface CleanupSessionApproval {
+  stagedWorktreePath?: string;
+}
+
+/** A successful add -A review is authority only within this cleanup invocation. */
+const cleanupSessionApprovals = new WeakMap<WorktreeEffectHooks, CleanupSessionApproval>();
+
+
 
 function environmentKeys(): readonly string[] {
   return Object.keys(process.env).sort();
@@ -293,6 +329,8 @@ function environmentKeys(): readonly string[] {
  * have to be checked to reproduce `execFileSync`'s "throws on anything but a
  * clean exit".
  */
+const WORKTREE_COMMAND_DEADLINE_MS = 30_000;
+
 async function git(
   pi: ExtensionAPI,
   cwd: string,
@@ -333,10 +371,17 @@ async function git(
       ...(!hardened && isForkReadOnlyGitCommand("git", args) ? { readOnly: true as const } : {}),
     }, effectKind(kind));
     hooks.assertSnapshotActive?.(effectKind(kind));
-    if (owner && ["worktree-capture", "worktree-remove", "worktree-prune"].includes(kind) && !worktreeGitDirMatches(owner)) {
+
+    if (kind === "worktree-capture" && args[0] === "add" && args.length === 2 && args[1] === "-A" &&
+      owner && hooks && sameOwnedWorktree(cwd, owner) && declaredBranch === owner.branch) {
+      const approval = cleanupSessionApprovals.get(hooks);
+      if (approval) approval.stagedWorktreePath = owner.path;
+    }
+    if (owner && ["worktree-capture", "worktree-remove", "worktree-prune"].includes(kind) &&
+      (!worktreeGitDirMatches(owner) || !safeWorktreeHeadMatches(owner))) {
       throw new GuardBridgeRejection(
         "guard-effect-unavailable", effectKind(kind),
-        `guard-effect-unavailable: guarded work is unavailable at ${effectKind(kind)}; the recorded worktree gitdir changed before execution.`,
+        `guard-effect-unavailable: guarded work is unavailable at ${effectKind(kind)}; the recorded worktree gitdir, common gitdir, or safe HEAD changed before execution.`,
       );
     }
     if (ownedByPackage && !packageOwnsCommand(kind, "git", args, cwd, owner, hooks, declaredBranch)) {
@@ -354,19 +399,59 @@ async function git(
         `guard-effect-unavailable: guarded work is unavailable at ${effectKind(kind)}; no exact recorded gitdir was available to harden the command.`,
       );
     }
-      const commandSignal = hooks.commandSignal ?? hooks.signal;
-    if (commandSignal?.aborted) {
+    if (hooks.signal?.aborted || hooks.commandSignal?.aborted) {
       throw new GuardBridgeRejection(
         "guard-effect-cancelled", effectKind(kind),
         `guard-effect-cancelled: guarded work is unavailable at ${effectKind(kind)}; the concrete effect was not executed.`,
       );
     }
   }
-  const commandSignal = hooks?.commandSignal ?? hooks?.signal;
-  const result = hardened
-    ? await runHardenedGit(actualArgs, cwd, timeout, env!, commandSignal)
-    : await pi.exec("git", actualArgs, { cwd, timeout, ...(commandSignal ? { signal: commandSignal } : {}) });
+  const commandController = hooks ? new AbortController() : undefined;
+  let commandTimedOut = false;
+  let commandTimer: ReturnType<typeof setTimeout> | undefined;
+  const sourceSignals = hooks ? [hooks.signal, hooks.commandSignal].filter((signal): signal is AbortSignal => signal !== undefined) : [];
+  const abortCommand = () => commandController?.abort();
+  for (const signal of sourceSignals) {
+    signal.addEventListener("abort", abortCommand, { once: true });
+    if (signal.aborted) abortCommand();
+  }
+  if (commandController) {
+    commandTimer = setTimeout(() => {
+      commandTimedOut = true;
+      commandController.abort();
+    }, WORKTREE_COMMAND_DEADLINE_MS);
+    commandTimer.unref?.();
+  }
+  const commandSignal = commandController?.signal ?? hooks?.commandSignal ?? hooks?.signal;
+  let result: { stdout: string; stderr: string; code: number; killed: boolean };
+  try {
+    result = hardened
+      ? await runHardenedGit(actualArgs, cwd, timeout, env!, commandSignal)
+      : await pi.exec("git", actualArgs, { cwd, timeout, ...(commandSignal ? { signal: commandSignal } : {}) });
+  } finally {
+    if (commandTimer !== undefined) clearTimeout(commandTimer);
+    for (const signal of sourceSignals) signal.removeEventListener("abort", abortCommand);
+  }
+  if (commandTimedOut) {
+    throw new GuardBridgeRejection(
+      "guard-effect-unavailable", effectKind(kind),
+      `guard-effect-unavailable: guarded work is unavailable at ${effectKind(kind)}; git command exceeded its 30-second deadline.`,
+    );
+  }
+  if (result.code === 0 && !result.killed) return result.stdout.trim();
+  if (commandSignal?.aborted) {
+    throw new GuardBridgeRejection(
+      "guard-effect-cancelled", effectKind(kind),
+      `guard-effect-cancelled: guarded work is unavailable at ${effectKind(kind)}; the concrete effect was not executed.`,
+    );
+  }
   if (result.killed || result.code !== 0) {
+    if (hooks && result.killed) {
+      throw new GuardBridgeRejection(
+        "guard-effect-unavailable", effectKind(kind),
+        `guard-effect-unavailable: guarded work is unavailable at ${effectKind(kind)}; git command timed out.`,
+      );
+    }
     throw new Error(result.stderr.trim() || `git ${actualArgs.join(" ")} failed (exit ${result.code})`);
   }
   return result.stdout.trim();
@@ -456,48 +541,56 @@ export async function cleanupWorktree(
   agentDescription: string,
   hooks?: WorktreeEffectHooks,
 ): Promise<WorktreeCleanupResult> {
-  const owner = findOwnedWorktree(hooks, worktree.path, ["status", "--porcelain"], worktree.path) ??
-    findOwnerForCleanup(hooks, worktree);
+  const cleanupHooks = hooks ? { ...hooks } : undefined;
+  if (cleanupHooks) cleanupSessionApprovals.set(cleanupHooks, {});
+  const statusArgs = cleanupHooks
+    ? ["status", "--porcelain", "--ignore-submodules=dirty", "--untracked-files=all"]
+    : ["status", "--porcelain"];
+  const owner = findOwnedWorktree(cleanupHooks, worktree.path, statusArgs, worktree.path) ??
+    findOwnerForCleanup(cleanupHooks, worktree);
   try {
     if (!existsSync(worktree.path)) return { hasChanges: false };
 
     try {
-      const status = await git(pi, worktree.path, ["status", "--porcelain"], 10000, "worktree-capture", hooks, worktree.branch, worktree.path);
+      const status = await git(pi, worktree.path, statusArgs, cleanupHooks ? WORKTREE_COMMAND_DEADLINE_MS : 10000, "worktree-capture", cleanupHooks, worktree.branch, worktree.path);
       if (status) {
-        await git(pi, worktree.path, ["add", "-A"], 10000, "worktree-capture", hooks, worktree.branch, worktree.path);
+        await git(pi, worktree.path, ["add", "-A"], cleanupHooks ? WORKTREE_COMMAND_DEADLINE_MS : 10000, "worktree-capture", cleanupHooks, worktree.branch, worktree.path);
         const safeDesc = agentDescription.slice(0, 200);
         const commitMsg = `pi-agent: ${safeDesc}`;
-        await git(pi, worktree.path, ["commit", "--no-verify", "-m", commitMsg], 10000, "worktree-capture", hooks, worktree.branch, worktree.path);
+        await git(pi, worktree.path, ["commit", "--no-verify", "-m", commitMsg], cleanupHooks ? WORKTREE_COMMAND_DEADLINE_MS : 10000, "worktree-capture", cleanupHooks, worktree.branch, worktree.path);
       } else {
-        const currentSha = await git(pi, worktree.path, ["rev-parse", "HEAD"], 5000, "worktree-capture", hooks, worktree.branch, worktree.path);
+        const currentSha = await git(pi, worktree.path, ["rev-parse", "HEAD"], cleanupHooks ? WORKTREE_COMMAND_DEADLINE_MS : 5000, "worktree-capture", cleanupHooks, worktree.branch, worktree.path);
         if (currentSha === worktree.baseSha) {
-          await removeWorktree(pi, cwd, worktree.path, hooks, worktree.branch);
+          await removeWorktree(pi, cwd, worktree.path, cleanupHooks, worktree.branch);
           return { hasChanges: false };
         }
       }
 
       let branchName = worktree.branch;
       try {
-        await git(pi, worktree.path, ["branch", branchName], 5000, "worktree-capture", hooks, branchName, worktree.path);
+        await git(pi, worktree.path, ["branch", branchName], cleanupHooks ? WORKTREE_COMMAND_DEADLINE_MS : 5000, "worktree-capture", cleanupHooks, branchName, worktree.path);
+        if (cleanupHooks) worktree.branchCreated = true;
       } catch (error) {
-        if (hooks && error instanceof GuardBridgeRejection) throw error;
+        if (cleanupHooks && error instanceof GuardBridgeRejection) throw error;
         branchName = `${worktree.branch}-${Date.now()}`;
-        if (owner && hooks && worktree.branch === owner.branch) {
+        if (owner && cleanupHooks && worktree.branch === owner.branch) {
           owner.branch = branchName;
           rememberOwner(owner);
         }
-        await git(pi, worktree.path, ["branch", branchName], 5000, "worktree-capture", hooks, branchName, worktree.path);
+        await git(pi, worktree.path, ["branch", branchName], cleanupHooks ? WORKTREE_COMMAND_DEADLINE_MS : 5000, "worktree-capture", cleanupHooks, branchName, worktree.path);
+        if (cleanupHooks) worktree.branchCreated = true;
       }
       worktree.branch = branchName;
-      await removeWorktree(pi, cwd, worktree.path, hooks, worktree.branch);
+      await removeWorktree(pi, cwd, worktree.path, cleanupHooks, worktree.branch);
       return { hasChanges: true, branch: worktree.branch, path: worktree.path };
     } catch (error) {
-      if (hooks && error instanceof GuardBridgeRejection) throw error;
-      try { await removeWorktree(pi, cwd, worktree.path, hooks, worktree.branch); } catch { /* best effort */ }
+      if (cleanupHooks && error instanceof GuardBridgeRejection) throw error;
+      try { await removeWorktree(pi, cwd, worktree.path, cleanupHooks, worktree.branch); } catch { /* best effort */ }
       return { hasChanges: false };
     }
   } finally {
     if (owner) forgetOwner(owner);
+    if (cleanupHooks) cleanupSessionApprovals.delete(cleanupHooks);
   }
 }
 
@@ -512,12 +605,12 @@ async function removeWorktree(
   branch?: string,
 ): Promise<void> {
   try {
-    await git(pi, cwd, ["worktree", "remove", "--force", worktreePath], 10000, "worktree-remove", hooks, branch, worktreePath);
+    await git(pi, cwd, ["worktree", "remove", "--force", worktreePath], hooks ? WORKTREE_COMMAND_DEADLINE_MS : 10000, "worktree-remove", hooks, branch, worktreePath);
   } catch (error) {
     if (hooks && error instanceof GuardBridgeRejection) throw error;
     // If git worktree remove fails, try pruning
     try {
-      await git(pi, cwd, ["worktree", "prune"], 5000, "worktree-prune", hooks, branch, worktreePath);
+      await git(pi, cwd, ["worktree", "prune"], hooks ? WORKTREE_COMMAND_DEADLINE_MS : 5000, "worktree-prune", hooks, branch, worktreePath);
     } catch (pruneError) {
       if (hooks && pruneError instanceof GuardBridgeRejection) throw pruneError;
       // best effort
@@ -530,6 +623,6 @@ async function removeWorktree(
  */
 export async function pruneWorktrees(pi: ExtensionAPI, cwd: string, hooks?: WorktreeEffectHooks): Promise<void> {
   try {
-    await git(pi, cwd, ["worktree", "prune"], 5000, "worktree-prune", hooks);
+    await git(pi, cwd, ["worktree", "prune"], hooks ? WORKTREE_COMMAND_DEADLINE_MS : 5000, "worktree-prune", hooks);
   } catch { /* best effort; a rejected review leaves git untouched */ }
 }

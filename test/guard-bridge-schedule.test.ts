@@ -497,6 +497,80 @@ describe("guard-off schedule compatibility", () => {
   });
 });
 
+describe("guarded schedule dispatch revalidation", () => {
+  it("marks a scope unresolved after the registration snapshot changes before fire (N12)", async () => {
+    const now = Date.now();
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    const { host } = makeHost({ scheduleScope: () => scopeResult(now) });
+    const scopeSnapshot = host.getResourceEnrollmentSnapshotIdentity()!;
+    const { store } = tempStore(true);
+    const { manager, calls } = fakeManager(host);
+    const scheduler = new SubagentScheduler({ now: () => now });
+    scheduler.start({ events: { emit: vi.fn() } } as any, { modelRegistry: {} } as any, manager, store);
+    const job = await scheduler.addGuardedJob({
+      name: "registration-replaced", description: "revalidate origin", schedule: "1h",
+      subagent_type: "general-purpose", prompt: "p", sourceIngressId: "creation-ingress",
+      sourceOrigin: "parent-model-delegation",
+    }, {
+      ingressId: "creation-ingress", origin: "parent-model-delegation", parentId: "root:session", headless: false,
+    }, request => host.createScheduleScope(request, undefined, scopeSnapshot),
+    () => host.assertScheduleScopeSnapshotActive(scopeSnapshot), scopeSnapshot);
+
+    const replacement = makeHost().registration;
+    host.unregister();
+    expect(host.register(replacement).compatible).toBe(true);
+    fire(scheduler, job.id);
+    await flushPromises();
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      guardOrigin: "imported-context",
+      guardScopeRefStatus: "unresolved",
+    });
+    expect(calls[0]).not.toHaveProperty("guardIngressId");
+    scheduler.stop();
+  });
+
+  it("disables a job whose persisted prompt changed after it was loaded, before dispatch", async () => {
+    const now = Date.now();
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    const { host } = makeHost({ scheduleScope: () => scopeResult(now) });
+    const { store, file } = tempStore(true);
+    const { manager, calls } = fakeManager(host);
+    const events: any[] = [];
+    const scheduler = new SubagentScheduler({ now: () => now });
+    scheduler.start({ events: { emit: (_name: string, event: any) => events.push(event) } } as any,
+      { modelRegistry: {} } as any, manager, store);
+    const job = await scheduler.addGuardedJob({
+      name: "edited-on-disk", description: "immutable dispatch", schedule: "1h",
+      subagent_type: "general-purpose", prompt: "ORIGINAL",
+    }, {
+      ingressId: "ingress", origin: "parent-model-delegation", parentId: "root:session", headless: true,
+    }, request => host.createScheduleScope(request));
+
+    // The scheduler keeps its loaded object in memory. ScheduleStore.update
+    // re-reads disk under lock; this simulates a direct edit after that load.
+    const disk = JSON.parse(readFileSync(file, "utf8"));
+    disk.jobs[0].prompt = "FORGED";
+    writeFileSync(file, JSON.stringify(disk));
+    fire(scheduler, job.id);
+    await flushPromises();
+
+    expect(calls).toHaveLength(0);
+    expect(manager.spawnScheduled).not.toHaveBeenCalled();
+    expect(store.get(job.id)).toMatchObject({
+      prompt: "FORGED",
+      enabled: false,
+      lastStatus: "expired",
+      guardExpiryReason: "guard-schedule-snapshot-mismatch",
+    });
+    expect(events).toContainEqual(expect.objectContaining({ type: "error", error: "guard-schedule-snapshot-mismatch" }));
+    scheduler.stop();
+  });
+});
+
 describe("headless fact propagation", () => {
   it.each([false, true])("derives scheduled-scope headless from ExtensionContext.hasUI=%s", async hasUI => {
     const requests: GuardScheduleScopeRequest[] = [];

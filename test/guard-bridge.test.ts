@@ -601,7 +601,7 @@ describe("versioned guard bridge contract", () => {
 
   it("scans every production agent-work callsite, not just whether each file is covered", () => {
     const expectedCounts: Record<string, Record<string, number>> = {
-      "src/agent-manager.ts": { runAgent: 1, steer: 2, spawn: 2, resumeAgent: 2 },
+      "src/agent-manager.ts": { runAgent: 1, steer: 2, spawn: 3, resumeAgent: 2 },
       "src/agent-runner.ts": { createAgentSession: 1, steer: 3, prompt: 3 },
       "src/index.ts": { spawn: 2, steer: 6, runMentionClone: 1, resume: 2, spawnAndWait: 2, steerAgent: 1, runWorkflow: 1, runWorkflowTask: 2 },
       "src/nested-tools.ts": { resume: 1, spawn: 1, spawnAndWait: 1, steer: 1 },

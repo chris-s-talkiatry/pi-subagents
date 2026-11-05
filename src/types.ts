@@ -218,9 +218,11 @@ export interface AgentRecord {
   /** Ingress evidence paired with queued steers, preserving child identity on replay. */
   pendingSteerEvidence?: (GuardIngressEvidence | undefined)[];
   /** Worktree info if the agent is running in an isolated worktree. */
-  worktree?: { path: string; branch: string; baseSha: string; workPath: string };
+  worktree?: { path: string; branch: string; baseSha: string; workPath: string; branchCreated?: boolean };
   /** Worktree cleanup result after agent completion. */
   worktreeResult?: { hasChanges: boolean; branch?: string };
+  /** Content-free recovery coordinates when guarded cleanup leaves a worktree behind. */
+  worktreeCleanupPending?: { path: string; branch: string; branchCreated: boolean; reason: string };
   /** The tool_use_id from the original Agent tool call. */
   toolCallId?: string;
   /** Path to the streaming output transcript file. */
@@ -338,6 +340,8 @@ export interface NotificationDetails {
   outputFile?: string;
   error?: string;
   resultPreview: string;
+  /** Bounded recovery coordinates for a worktree whose guarded cleanup was refused or timed out. */
+  worktreeCleanupPending?: { path: string; branch: string; branchCreated: boolean; reason: string };
   /** Additional agents in a group notification. */
   others?: NotificationDetails[];
 }
