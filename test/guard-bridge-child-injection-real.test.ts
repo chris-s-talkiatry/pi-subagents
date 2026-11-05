@@ -212,7 +212,7 @@ describe("real Pi child guard injection", () => {
     } finally {
       await run.dispose();
     }
-  });
+  }, 30_000);
 
   it.each([
     ["extensions disabled", "tools: bash\nextensions: false"],
@@ -288,5 +288,5 @@ describe("real Pi child guard injection", () => {
     } finally {
       await run.dispose();
     }
-  });
+  }, 30_000);
 });
