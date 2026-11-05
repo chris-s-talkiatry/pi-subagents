@@ -84,6 +84,8 @@ Agent({
   prompt: "Look at recent commits and summarize what changed since last week",
   description: "Weekly commit review",
   schedule: "0 0 9 * * 1",   // 9am every Monday (6-field cron)
+  expires_at: "2026-12-31T23:59:59.000Z", // optional; guarded schedules only
+  max_runs: 20,               // optional; guarded schedules only
 })
 ```
 
@@ -104,6 +106,8 @@ Restrictions:
 - `schedule` cannot be combined with `inherit_context` (no parent conversation exists at fire time) or `resume` (schedules create fresh agents).
 - `run_in_background: false` is refused — scheduled jobs always run in the background. Omitting it, or passing `true`, is fine.
 - Scheduled fires bypass the `maxConcurrent` queue so a 5-minute interval cannot be deferred behind long-running manual agents.
+- With `guardExpected: true`, each schedule requires a guard-minted bounded scope. Optional `expires_at` (ISO timestamp) and `max_runs` narrow it; absent values default to a fixed 24-hour lifetime and 100 total starts (these policy defaults are code constants, not settings-configurable), and larger values are capped. The editable schedule file is not authority: restored scope IDs are passed unresolved for the guard to validate, never as ambient scope. Invalid/expired/exhausted jobs are disabled and reported once.
+- A guarded headless root (for example `pi -p`, where `ctx.hasUI` is false) proceeds only within the guard's existing grants/automatic policy. A request that needs a person returns `approval-needed`; no queue waits for a UI that is not present. Scheduled fire-time context creation has a 10-second bound.
 - **Headless `pi -p` doesn't wait for scheduled subagents.**
 
 ## UI
@@ -617,7 +621,7 @@ Runtime tuning values set via `/agents` → Settings (max concurrency, max foreg
 
 **Precedence:** project overrides global on any field present in both. Missing fields fall back to the hardcoded defaults (max concurrency `10`, max foreground concurrency `0` = unlimited, default max turns unlimited, grace turns `5`, nested depth `2`, join mode `smart`, defaults enabled).
 
-**Guard bridge opt-in:** `guardExpected` (default `false`) requires a guard registration before supported subagent work. With `guardExpected: true`, set `guardRegistrant` to the expected non-empty extension id; conflicting global/project ids or a missing id fail closed. These configuration-only keys can be written by hand in `subagents.json`; `/agents` preserves project-owned values without copying global-only ones. Registrant identity prevents accidental/misordered registration, but does not authenticate against a malicious in-process extension—all in-process extensions are trusted code. See the [guard bridge contract](docs/guard-bridge.md).
+**Guard bridge opt-in:** `guardExpected` (default `false`) requires a guard registration before supported subagent work. With `guardExpected: true`, set `guardRegistrant` to the expected non-empty extension id; conflicting global/project ids or a missing id fail closed. These configuration-only keys can be written by hand in `subagents.json`; `/agents` preserves project-owned values without copying global-only ones. Guarded child sessions also require the registration's `createChildGuardExtension` hook, and discovered guard copies can detect child context via `getGuardChildContext(pi.events)` and stay inert. Registrant identity prevents accidental/misordered registration, but does not authenticate against a malicious in-process extension—all in-process extensions are trusted code. See the [guard bridge contract](docs/guard-bridge.md).
 
 A present non-boolean `guardExpected` and malformed settings JSON mentioning `guardExpected`/`guardRegistrant` fail closed. An unreadable settings file warns and is ignored rather than turning guarding on; the guard-bridge advertisement exposes `configDiagnostic` and the effective `guardExpected` so a guard requiring opt-in can detect that its expected configuration was not loaded.
 
@@ -952,6 +956,8 @@ src/
   agent-color.ts      # Claude Code/Agency Agents name color parsing and badge rendering
 
   # Execution
+  guard-bridge.ts      # Versioned registration, child-context ownership, and child-session injection
+
   agent-runner.ts     # Session creation, execution, graceful max_turns, steer/resume
   agent-manager.ts    # Agent lifecycle, concurrency queue, completion notifications
   nested-tools.ts     # Delegation tools handed to subagents (nested spawn/collect/steer)

@@ -53,19 +53,26 @@ function eventBus() {
 }
 
 function registration(protocolVersion = 1): GuardBridgeRegistration {
-  return {
+  let active: GuardBridgeRegistration;
+  active = {
     registrant: { id: "scope-guard", version: "1" },
     protocolVersion,
     callbacks: {
       captureIngress: vi.fn(),
       enrollResource: vi.fn(),
-      createChildContext: vi.fn((value: any) => ({ ...value, bridgeRef: registration(1) })),
+      createChildContext: vi.fn((request: any) => ({
+        rootId: "root", parentId: request.parentId, childId: request.childId, delegationId: request.delegationId,
+        taskId: "task", scopeRevision: 0, executionEpoch: 0, resolvedRestrictions: [], origin: request.origin, bridgeRef: active,
+      })),
       revalidate: vi.fn(() => "allowed"),
       approvalSettled: vi.fn(),
       approvalCancelled: vi.fn(),
       approvalExpired: vi.fn(),
     },
+    createChildGuardExtension: vi.fn(() => vi.fn()),
+
   };
+  return active;
 }
 
 const session = () => ({
@@ -368,7 +375,11 @@ describe("real mention resume and steer handlers", () => {
 
     expect(result).toEqual({ action: "handled" });
     expect(steer).toHaveBeenCalledTimes(1);
-    expect(steer).toHaveBeenCalledWith(seeded.id, "proceed once");
+    if (mode === "compatible") {
+      expect(steer).toHaveBeenCalledWith(seeded.id, "proceed once", expect.objectContaining({ origin: "human", entryPath: "mention.input-steer" }));
+    } else {
+      expect(steer).toHaveBeenCalledWith(seeded.id, "proceed once");
+    }
     expect(seeded.session.steer).toHaveBeenCalledTimes(1);
     expect(seeded.session.steer).toHaveBeenCalledWith("proceed once");
     expect(runnerMocks.runAgent).not.toHaveBeenCalled();
@@ -421,7 +432,7 @@ describe("real mention resume and steer handlers", () => {
       isBackground: true,
       guardEntryPath: "mention.input-resume",
     }));
-    expect(runnerMocks.resumeAgent).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(runnerMocks.resumeAgent).toHaveBeenCalledTimes(1));
     expect(seeded.session.steer).not.toHaveBeenCalled();
     expect(runnerMocks.runAgent).not.toHaveBeenCalled();
   });
@@ -583,7 +594,14 @@ describe("real conversation and fleet viewer steer composers", () => {
     viewer.handleInput("\r");
 
     expect(steer).toHaveBeenCalledTimes(1);
-    expect(steer).toHaveBeenCalledWith(seeded.id, "proceed once");
+    if (mode === "compatible") {
+      expect(steer).toHaveBeenCalledWith(seeded.id, "proceed once", expect.objectContaining({
+        origin: "human",
+        entryPath: "conversation-viewer.steer",
+      }));
+    } else {
+      expect(steer).toHaveBeenCalledWith(seeded.id, "proceed once");
+    }
     expect(seeded.session.steer).toHaveBeenCalledTimes(1);
     expect(seeded.session.steer).toHaveBeenCalledWith("proceed once");
     viewer.handleInput("q");
@@ -674,7 +692,14 @@ describe("real conversation and fleet viewer steer composers", () => {
     viewer.handleInput("\r");
 
     expect(steer).toHaveBeenCalledTimes(1);
-    expect(steer).toHaveBeenCalledWith(seeded.id, "fleet proceed once");
+    if (mode === "compatible") {
+      expect(steer).toHaveBeenCalledWith(seeded.id, "fleet proceed once", expect.objectContaining({
+        origin: "human",
+        entryPath: "fleet-viewer.steer",
+      }));
+    } else {
+      expect(steer).toHaveBeenCalledWith(seeded.id, "fleet proceed once");
+    }
     expect(seeded.session.steer).toHaveBeenCalledTimes(1);
     expect(seeded.session.steer).toHaveBeenCalledWith("fleet proceed once");
     viewer.handleInput("q");
@@ -754,7 +779,14 @@ describe("real workflow-host resume handler", () => {
 
     expect(result).toMatchObject({ ok: true, text: "resumed answer" });
     expect(resume).toHaveBeenCalledTimes(1);
-    expect(resume).toHaveBeenCalledWith(state.record.id, "workflow follow up", undefined);
+    if (guarded) {
+      expect(resume).toHaveBeenCalledWith(state.record.id, "workflow follow up", undefined, expect.objectContaining({
+        guardEntryPath: "workflow-host.resume",
+        guardIngressEvidence: expect.objectContaining({ origin: "parent-model-delegation", entryPath: "workflow-host.resume" }),
+      }));
+    } else {
+      expect(resume).toHaveBeenCalledWith(state.record.id, "workflow follow up", undefined);
+    }
     expect(runnerMocks.resumeAgent).toHaveBeenCalledTimes(1);
     expect(state.session.steer).not.toHaveBeenCalled();
     expect(runnerMocks.runAgent).not.toHaveBeenCalled();

@@ -29,19 +29,34 @@ const enrollment = {
 };
 
 function registration(enrollResource: (value: any) => void | Promise<void>): GuardBridgeRegistration {
-  return {
+  let active: GuardBridgeRegistration;
+  active = {
     protocolVersion: 1,
     registrant: { id: "scope-guard", version: "1" },
     callbacks: {
       captureIngress: vi.fn(),
       enrollResource,
-      createChildContext: vi.fn(async (value: any) => value),
+      createChildContext: vi.fn(async (request: any) => ({
+        rootId: "root",
+        parentId: request.parentId,
+        childId: request.childId,
+        delegationId: request.delegationId,
+        taskId: "task",
+        scopeRevision: 0,
+        executionEpoch: 0,
+        resolvedRestrictions: [],
+        origin: request.origin,
+        bridgeRef: active,
+      })),
       revalidate: vi.fn(() => "allowed"),
       approvalSettled: vi.fn(),
       approvalCancelled: vi.fn(),
       approvalExpired: vi.fn(),
     },
+    createChildGuardExtension: vi.fn(() => vi.fn()),
+
   };
+  return active;
 }
 
 function rejectWithEnrollmentDiagnostic(manager: AgentManager): void {

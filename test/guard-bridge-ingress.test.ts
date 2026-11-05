@@ -36,12 +36,21 @@ function createCapture(log: string[] = []) {
     callbacks: {
       captureIngress: vi.fn((value) => { log.push("capture"); evidence.push(value); }),
       enrollResource: vi.fn(),
-      createChildContext: vi.fn((value: any) => ({ ...value, bridgeRef: registration })),
+      createChildContext: vi.fn((request: any) => ({
+        rootId: "root", parentId: request.parentId, childId: request.childId, delegationId: request.delegationId,
+        taskId: "task", scopeRevision: 0, executionEpoch: 0, resolvedRestrictions: [], origin: request.origin, bridgeRef: registration,
+      })),
       revalidate: vi.fn(() => "allowed"),
       approvalSettled: vi.fn(),
       approvalCancelled: vi.fn(),
       approvalExpired: vi.fn(),
+      createScheduleScope: vi.fn(() => {
+        log.push("scope");
+        return { scopeId: "scope-1", expiresAt: new Date(Date.now() + 60_000).toISOString(), maxRuns: 1, targetBindings: ["target:read"] };
+      }),
     },
+    createChildGuardExtension: vi.fn(() => vi.fn()),
+
   };
   return { evidence, registration, log };
 }
@@ -284,6 +293,8 @@ describe("real supported ingress handlers", () => {
     const opened = boot({ agentMentions: "direct" });
     const capture = await registerCapture(opened);
     const live = seedAgent(opened.manager, opened.pi, "running");
+    await vi.waitFor(() => expect(live.record.guardChildContext).toBeDefined());
+
 
     capture.log.length = 0;
     capture.evidence.length = 0;
@@ -301,6 +312,11 @@ describe("real supported ingress handlers", () => {
       rawText: rawSteer,
       transformedText: "redirect it",
       target: `agent:${live.id}`,
+      childId: live.record.guardChildContext!.childId,
+      delegationId: live.record.guardChildContext!.delegationId,
+      parentId: live.record.guardChildContext!.parentId,
+
+
       origin: "human",
       entryPath: "mention.input-steer",
     });
@@ -360,6 +376,9 @@ describe("real supported ingress handlers", () => {
       entryPath: "agents-command.generate-definition",
     });
     expect(capture.log).toEqual(["capture", "spawn"]);
+    expect(spawn.mock.calls[0][4].guardIngressEvidence.ingressId).toBe(capture.evidence[0].ingressId);
+
+
     expect(spawn).toHaveBeenCalledTimes(1);
   });
 
@@ -367,6 +386,8 @@ describe("real supported ingress handlers", () => {
     const opened = boot();
     const capture = await registerCapture(opened);
     const seeded = seedAgent(opened.manager, opened.pi, "running");
+    await vi.waitFor(() => expect(seeded.record.guardChildContext).toBeDefined());
+
 
     capture.log.length = 0;
     capture.evidence.length = 0;
@@ -400,6 +421,10 @@ describe("real supported ingress handlers", () => {
     expect(capture.evidence.at(-1)).toMatchObject({
       rawText: "human viewer steer",
       coverage: "complete",
+      childId: seeded.record.guardChildContext!.childId,
+      delegationId: seeded.record.guardChildContext!.delegationId,
+      parentId: seeded.record.guardChildContext!.parentId,
+
       target: `agent:${seeded.id}`,
       origin: "human",
       entryPath: "conversation-viewer.steer",
@@ -416,6 +441,8 @@ describe("real supported ingress handlers", () => {
     const opened = boot();
     const capture = await registerCapture(opened);
     const seeded = seedAgent(opened.manager, opened.pi, "running");
+    await vi.waitFor(() => expect(seeded.record.guardChildContext).toBeDefined());
+
     capture.log.length = 0;
     capture.evidence.length = 0;
     (capture.registration.callbacks.captureIngress as any).mockClear();
@@ -460,6 +487,10 @@ describe("real supported ingress handlers", () => {
     expect(capture.evidence.at(-1)).toMatchObject({
       rawText: "fleet human steer",
       coverage: "complete",
+      childId: seeded.record.guardChildContext!.childId,
+      delegationId: seeded.record.guardChildContext!.delegationId,
+      parentId: seeded.record.guardChildContext!.parentId,
+
       target: `agent:${seeded.id}`,
       origin: "human",
       entryPath: "fleet-viewer.steer",
@@ -500,8 +531,15 @@ describe("real supported ingress handlers", () => {
     await registerCapture(opened, capture);
     const nestedManager = new AgentManager();
     nestedManager.registerGuard(capture.registration);
+    nestedManager.setGuardRegistrant("scope-guard");
+    nestedManager.setGuardExpected(true);
+
     const parent = seedAgent(nestedManager, opened.pi, "running");
+    await vi.waitFor(() => expect(parent.record.guardChildContext).toBeDefined());
+
     const child = seedAgent(nestedManager, opened.pi, "running", parent.id);
+    await vi.waitFor(() => expect(child.record.guardChildContext).toBeDefined());
+
     child.record.session.steer.mockImplementation((message: string) => {
       capture.log.push("steer");
       return Promise.resolve(message);
@@ -526,6 +564,10 @@ describe("real supported ingress handlers", () => {
     expect(capture.evidence.at(-1)).toMatchObject({
       rawText: "parent model says approved",
       coverage: "complete",
+      childId: child.record.guardChildContext!.childId,
+      delegationId: child.record.guardChildContext!.delegationId,
+      parentId: child.record.guardChildContext!.parentId,
+
       target: `agent:${child.id}`,
       origin: "parent-model-delegation",
       entryPath: "nested-agent.steer",
@@ -595,6 +637,7 @@ describe("remaining owned ingress paths", () => {
     expect(resume).toHaveBeenCalledTimes(1);
   });
 
+
   it.each(["unregister", "replace"] as const)("does not create a schedule from a capture bound to an inactive registration (%s)", async (change) => {
     const opened = boot();
     const capture = createCapture();
@@ -609,7 +652,7 @@ describe("remaining owned ingress paths", () => {
       return undefined;
     });
     await registerCapture(opened, capture);
-    const addJob = vi.spyOn(SubagentScheduler.prototype, "addJob").mockImplementation(() => ({ id: "never-created", name: "schedule", scheduleType: "once" } as any));
+    const addJob = vi.spyOn(SubagentScheduler.prototype, "addGuardedJob").mockImplementation(async () => ({ id: "never-created", name: "schedule", scheduleType: "once" } as any));
     const invocation = opened.tools.get("Agent").execute("schedule-pending", {
       prompt: "pending scheduled prompt", description: "pending schedule", subagent_type: "explore", schedule: "+10m",
     }, undefined, undefined, ctx());
@@ -624,7 +667,16 @@ describe("remaining owned ingress paths", () => {
   it("captures schedule-create as model delegation before the scheduler consumes it", async () => {
     const opened = boot();
     const capture = await registerCapture(opened);
-    vi.spyOn(SubagentScheduler.prototype, "addJob").mockImplementation((input: any) => {
+    let addedJob: any;
+    vi.spyOn(SubagentScheduler.prototype, "addGuardedJob").mockImplementation(async (input: any, requestBase: any, createScope: any) => {
+      addedJob = input;
+      await createScope({
+        ...requestBase,
+        jobId: "scheduled-job",
+        schedule: input.schedule,
+        scheduleType: "once",
+        nextRun: new Date(Date.now() + 60_000).toISOString(),
+      });
       capture.log.push("schedule");
       return { id: "scheduled-job", name: input.name, scheduleType: "once" } as any;
     });
@@ -641,7 +693,9 @@ describe("remaining owned ingress paths", () => {
       rawText, coverage: "complete", target: "session:s1", origin: "parent-model-delegation",
       entryPath: "agent-tool.schedule-create",
     });
-    expect(capture.log).toEqual(["capture", "schedule"]);
+    expect(capture.log).toEqual(["capture", "scope", "schedule"]);
+    expect(addedJob).toMatchObject({ sourceIngressId: capture.evidence[0].ingressId, sourceOrigin: "parent-model-delegation" });
+
   });
 
   it("captures foreground Agent-tool spawn before spawnAndWait", async () => {
@@ -670,6 +724,8 @@ describe("remaining owned ingress paths", () => {
     const opened = boot();
     const capture = await registerCapture(opened);
     const live = seedAgent(opened.manager, opened.pi, "running");
+    await vi.waitFor(() => expect(live.record.guardChildContext).toBeDefined());
+
     runnerMocks.steerAgent.mockImplementation(async () => { capture.log.push("steer"); });
     capture.log.length = 0;
     capture.evidence.length = 0;
@@ -678,7 +734,11 @@ describe("remaining owned ingress paths", () => {
     await opened.tools.get("steer_subagent").execute("steer", { agent_id: live.id, message: rawText }, undefined, undefined, ctx());
     expect(capture.registration.callbacks.captureIngress).toHaveBeenCalledTimes(1);
     expect(capture.evidence[0]).toMatchObject({
-      rawText, coverage: "complete", target: `agent:${live.id}`, origin: "parent-model-delegation", entryPath: "agent-tool.steer",
+      rawText, coverage: "complete", target: `agent:${live.id}`, origin: "parent-model-delegation",
+      childId: live.record.guardChildContext!.childId,
+      delegationId: live.record.guardChildContext!.delegationId,
+      parentId: live.record.guardChildContext!.parentId,
+      entryPath: "agent-tool.steer",
     });
     expect(capture.log).toEqual(["capture", "steer"]);
 
@@ -695,6 +755,8 @@ describe("remaining owned ingress paths", () => {
     const opened = boot();
     const capture = await registerCapture(opened);
     const live = seedAgent(opened.manager, opened.pi, "running");
+    await vi.waitFor(() => expect(live.record.guardChildContext).toBeDefined());
+
     live.record.session = undefined;
     live.record.pendingSteers = { push: vi.fn(() => capture.log.push("queue")) } as any;
     capture.log.length = 0;
@@ -704,7 +766,11 @@ describe("remaining owned ingress paths", () => {
     await opened.tools.get("steer_subagent").execute("queued-steer", { agent_id: live.id, message: rawText }, undefined, undefined, ctx());
     expect(capture.registration.callbacks.captureIngress).toHaveBeenCalledTimes(1);
     expect(capture.evidence[0]).toMatchObject({
-      rawText, coverage: "complete", target: `agent:${live.id}`, origin: "parent-model-delegation", entryPath: "agent-tool.steer",
+      rawText, coverage: "complete", target: `agent:${live.id}`, origin: "parent-model-delegation",
+      childId: live.record.guardChildContext!.childId,
+      delegationId: live.record.guardChildContext!.delegationId,
+      parentId: live.record.guardChildContext!.parentId,
+      entryPath: "agent-tool.steer",
     });
     expect(capture.log).toEqual(["capture", "queue"]);
     expect(live.record.pendingSteers.push).toHaveBeenCalledWith(rawText);
@@ -718,6 +784,8 @@ describe("remaining owned ingress paths", () => {
     nestedManager.setGuardExpected(true);
     nestedManager.setGuardRegistrant("scope-guard");
     const parent = seedAgent(nestedManager, opened.pi, "running");
+    await vi.waitFor(() => expect(parent.record.guardChildContext).toBeDefined());
+
     const tools = createNestedSubagentTools({ manager: nestedManager, pi: opened.pi, parentAgentId: parent.id, depth: 1, maxSubagentDepth: 3, allowedSubagents: "all", configCwd: process.cwd() });
     const action = mode === "background"
       ? vi.spyOn(nestedManager, "spawn").mockImplementation(() => { capture.log.push("spawn"); return "nested-spawn"; })
@@ -747,7 +815,14 @@ describe("remaining owned ingress paths", () => {
     nestedManager.setGuardExpected(true);
     nestedManager.setGuardRegistrant("scope-guard");
     const parent = seedAgent(nestedManager, opened.pi, "running");
-    const existing = seedAgent(nestedManager, opened.pi, "completed", parent.id);
+    await nestedManager.awaitStartup(parent.id);
+    await vi.waitFor(() => expect(parent.record.guardChildContext).toBeDefined());
+
+    const existing = seedAgent(nestedManager, opened.pi, "running", parent.id);
+    await nestedManager.awaitStartup(existing.id);
+    existing.record.status = "completed";
+    await vi.waitFor(() => expect(existing.record.guardChildContext).toBeDefined());
+
     const resume = vi.spyOn(nestedManager, "resume").mockImplementation(async () => {
       capture.log.push("resume");
       return existing.record;
@@ -800,6 +875,8 @@ describe("remaining owned ingress paths", () => {
     });
     await registerCapture(opened, capture);
     const seeded = seedAgent(opened.manager, opened.pi, "running");
+    await vi.waitFor(() => expect(seeded.record.guardChildContext).toBeDefined());
+
     const host = new GuardBridgeHost(true, "scope-guard");
     host.register(capture.registration);
     capture.log.length = 0;
@@ -842,7 +919,11 @@ describe("remaining owned ingress paths", () => {
     await flush();
     expect(capture.registration.callbacks.captureIngress).toHaveBeenCalledTimes(1);
     expect(capture.evidence[0]).toMatchObject({
-      rawText: "fleet pending steer", coverage: "complete", target: `agent:${seeded.id}`, origin: "human", entryPath: "fleet-viewer.steer",
+      rawText: "fleet pending steer", coverage: "complete", target: `agent:${seeded.id}`, origin: "human",
+      childId: seeded.record.guardChildContext!.childId,
+      delegationId: seeded.record.guardChildContext!.delegationId,
+      parentId: seeded.record.guardChildContext!.parentId,
+      entryPath: "fleet-viewer.steer",
     });
     expect(steer).not.toHaveBeenCalled();
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("guard-missing"), "warning");

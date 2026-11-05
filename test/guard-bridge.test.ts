@@ -66,6 +66,11 @@ const ENTRY_PATH_IDS: readonly GuardEntryPathId[] = [
   "workflow-tool.dispatch",
   "workflow-cli-flag.dispatch",
   "workflow.pi-exec.gate",
+  "worktree.create",
+  "worktree.capture",
+  "worktree.remove",
+  "worktree.prune",
+  "agent-runner.detect-env",
   "agents-command.generate-definition",
   "conversation-viewer.steer",
   "fleet-viewer.steer",
@@ -78,13 +83,21 @@ const ENTRY_PATH_IDS: readonly GuardEntryPathId[] = [
 const callbacks = {
   captureIngress: vi.fn(),
   enrollResource: vi.fn(),
-  createChildContext: vi.fn((context: any) => ({ ...context, bridgeRef: registration })),
+  createChildContext: vi.fn((request: any) => ({
+    rootId: "root", parentId: request.parentId, childId: request.childId, delegationId: request.delegationId,
+    taskId: "task", scopeRevision: 0, executionEpoch: 0, resolvedRestrictions: [], origin: request.origin, bridgeRef: registration,
+  })),
   revalidate: vi.fn(() => "allowed" as const),
   approvalSettled: vi.fn(),
   approvalCancelled: vi.fn(),
   approvalExpired: vi.fn(),
 };
-const registration: GuardBridgeRegistration = { registrant: { id: "scope-guard", version: "1" }, protocolVersion: 1, callbacks };
+const registration: GuardBridgeRegistration = {
+  registrant: { id: "scope-guard", version: "1" },
+  protocolVersion: 1,
+  callbacks,
+  createChildGuardExtension: vi.fn(() => vi.fn()),
+};
 
 function rejection(
   host: GuardBridgeHost,
@@ -193,7 +206,7 @@ describe("versioned guard bridge contract", () => {
     expect(Object.getOwnPropertyNames(globalThis)).toEqual(beforeNames);
     expect(Object.getOwnPropertySymbols(globalThis)).toEqual(beforeSymbols);
     expect(Object.getOwnPropertyNames(host)).toEqual(["expected", "registration", "registrationSnapshot", "ingressSnapshots", "registrationRejected", "registrationRejectedReasonCode", "registrationRejectionHistory", "guardExpectedDiagnostic", "guardRegistrant", "guardRegistrantDiagnostic"]);
-    expect(Object.getOwnPropertyNames(registration)).toEqual(["registrant", "protocolVersion", "callbacks"]);
+    expect(Object.getOwnPropertyNames(registration)).toEqual(["registrant", "protocolVersion", "callbacks", "createChildGuardExtension"]);
     expect(JSON.stringify(host)).not.toContain("identical prompt");
   });
 
@@ -356,7 +369,7 @@ describe("versioned guard bridge contract", () => {
       manager.setMaxConcurrent(2);
       await vi.waitFor(() => expect(manager.getRecord(queuedSpawnId)?.status).toBe("error"));
       expect(manager.getRecord(queuedSpawnId)?.error).toBe(
-        "guard-missing: guarded work is unavailable at agent-manager.spawn; no guard bridge registration is present.",
+        "guard-child-injection-failed: guarded work is unavailable at agent-manager.spawn; the validated guard registration changed before child construction.",
       );
       expect(runnerMock.runAgent).toHaveBeenCalledTimes(2);
 
@@ -374,7 +387,7 @@ describe("versioned guard bridge contract", () => {
       manager.setMaxConcurrent(2);
       await vi.waitFor(() => expect(firstRecord.status).toBe("error"));
       expect(firstRecord.error).toBe(
-        "guard-missing: guarded work is unavailable at agent-manager.resume; no guard bridge registration is present.",
+        "guard-child-injection-failed: guarded work is unavailable at agent-manager.resume; the validated guard registration changed before child construction.",
       );
       expect(firstRecord.startedAt).toBe(startedAtBeforeDrain);
       expect(runnerMock.runAgent).toHaveBeenCalledTimes(2);
@@ -588,17 +601,17 @@ describe("versioned guard bridge contract", () => {
 
   it("scans every production agent-work callsite, not just whether each file is covered", () => {
     const expectedCounts: Record<string, Record<string, number>> = {
-      "src/agent-manager.ts": { runAgent: 1, steer: 2, spawn: 1, resumeAgent: 2 },
+      "src/agent-manager.ts": { runAgent: 1, steer: 2, spawn: 2, resumeAgent: 2 },
       "src/agent-runner.ts": { createAgentSession: 1, steer: 3, prompt: 3 },
-      "src/index.ts": { spawn: 2, steer: 3, runMentionClone: 1, resume: 2, spawnAndWait: 2, steerAgent: 1, runWorkflow: 1, runWorkflowTask: 2 },
+      "src/index.ts": { spawn: 2, steer: 6, runMentionClone: 1, resume: 2, spawnAndWait: 2, steerAgent: 1, runWorkflow: 1, runWorkflowTask: 2 },
       "src/nested-tools.ts": { resume: 1, spawn: 1, spawnAndWait: 1, steer: 1 },
 
       "src/schedule.ts": { spawn: 1 },
-      "src/cross-extension-rpc.ts": { spawn: 1 },
-      "src/workflow/host.ts": { exec: 1, spawnAndWait: 1, resume: 1 },
+      "src/cross-extension-rpc.ts": { spawn: 2 },
+      "src/workflow/host.ts": { exec: 1, spawnAndWait: 1, resume: 2 },
       "src/workflow/runtime.ts": { resumeAgent: 1 },
       "src/mention-clone.ts": { createAgentSession: 1, prompt: 1 },
-      "src/ui/fleet-list.ts": { steer: 2 },
+      "src/ui/fleet-list.ts": { steer: 4 },
     };
     const sourceRoot = join(process.cwd(), "src");
     const sourceFiles = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap(entry => {

@@ -62,6 +62,8 @@ interface NestedSpawnOptions {
   invocation?: AgentInvocation;
   signal?: AbortSignal;
   guardEntryPath?: GuardEntryPathId;
+  guardIngressEvidence?: GuardIngressEvidence;
+
   onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
   onSessionCreated?: (session: AgentSession) => void;
   depth: number;
@@ -98,7 +100,7 @@ export interface NestedAgentManager {
     id: string,
     prompt: string,
     signal?: AbortSignal,
-    options?: { guardEntryPath?: GuardEntryPathId },
+    options?: { guardEntryPath?: GuardEntryPathId; guardIngressEvidence?: GuardIngressEvidence },
   ): Promise<AgentRecord | undefined>;
 }
 
@@ -214,6 +216,8 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
 
         const resumed = await context.manager.resume(params.resume, params.prompt, signal, {
           guardEntryPath: "nested-agent.resume",
+          ...(capture !== undefined ? { guardIngressEvidence: capture } : {}),
+
         });
         return resumed
           ? textResult(formatRecord(resumed, "inline"), resumed.status === "error")
@@ -377,6 +381,8 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
             ...options,
             guardEntryPath: "nested-agent.spawn-background",
             isBackground: true,
+            ...(capture !== undefined ? { guardIngressEvidence: capture } : {}),
+
           });
           // Synchronous, before the event loop yields — onSessionCreated fires
           // asynchronously inside runAgent, so the file is attached in time.
@@ -392,7 +398,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           ctx,
           resolvedType,
           params.prompt,
-          { ...options, guardEntryPath: "nested-agent.spawn-foreground", signal },
+          { ...options, guardEntryPath: "nested-agent.spawn-foreground", signal, ...(capture !== undefined ? { guardIngressEvidence: capture } : {}) },
           attachTranscript,
         );
         return textResult(formatRecord(record, "inline"), record.status === "error");
@@ -447,6 +453,12 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         rawText: params.message,
         coverage: "complete",
         target: `agent:${record.id}`,
+        ...(record.guardChildContext ? {
+          childId: record.guardChildContext.childId,
+          delegationId: record.guardChildContext.delegationId,
+          parentId: record.guardChildContext.parentId,
+        } : {}),
+
         origin: "parent-model-delegation",
         entryPath: "nested-agent.steer",
       });
@@ -457,6 +469,9 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       if (!record.session) {
         if (!record.pendingSteers) record.pendingSteers = [];
         record.pendingSteers.push(params.message);
+        if (capture && !record.pendingSteerEvidence) record.pendingSteerEvidence = Array.from({ length: record.pendingSteers.length - 1 }, () => undefined);
+        if (record.pendingSteerEvidence) record.pendingSteerEvidence.push(capture);
+
         return textResult(`Steering message queued for nested agent ${params.agent_id}.`);
       }
       try {

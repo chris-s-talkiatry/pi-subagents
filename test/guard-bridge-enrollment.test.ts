@@ -36,7 +36,7 @@ vi.mock("../src/agent-types.js", async () => {
 vi.mock("../src/skill-loader.js", () => ({ preloadSkills: vi.fn(() => resourceMocks.loaded) }));
 
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
-import { GuardBridgeHost, type GuardBridgeRegistration } from "../src/guard-bridge.js";
+import { GuardBridgeHost, type GuardBridgeRegistration, type GuardChildContext } from "../src/guard-bridge.js";
 import { ctx, makePi } from "./helpers/boot-extension.js";
 
 let events: string[];
@@ -72,20 +72,51 @@ function fakeSession() {
 }
 
 function registration(enrollResource: (value: any) => void | Promise<void>): GuardBridgeRegistration {
-  return {
+  let active: GuardBridgeRegistration;
+  active = {
     protocolVersion: 1,
     registrant: { id: "scope-guard", version: "1" },
     callbacks: {
       captureIngress: vi.fn(),
       enrollResource,
-      createChildContext: vi.fn(async (value: any) => ({ ...value, bridgeRef: registration(enrollResource) })),
+      createChildContext: vi.fn(async (request: any) => ({
+        rootId: "root", parentId: request.parentId, childId: request.childId, delegationId: request.delegationId,
+        taskId: "task", scopeRevision: 0, executionEpoch: 0, resolvedRestrictions: [], origin: request.origin, bridgeRef: active,
+      })),
       revalidate: vi.fn(() => "allowed"),
       approvalSettled: vi.fn(),
       approvalCancelled: vi.fn(),
       approvalExpired: vi.fn(),
     },
+    createChildGuardExtension: vi.fn(() => vi.fn()),
+
+  };
+  return active;
+}
+
+function guardedRunnerOptions(host: GuardBridgeHost) {
+  const registration = host.getRegistration()!;
+  const guardChildContext: GuardChildContext = Object.freeze({
+    rootId: "root",
+    parentId: "root:parent",
+    childId: "child-runner",
+    delegationId: "delegation-runner",
+    taskId: "task-runner",
+    scopeRevision: 0,
+    executionEpoch: 0,
+    resolvedRestrictions: [],
+    origin: "parent-model-delegation",
+    bridgeRef: registration,
+  });
+  return {
+    guardBridgeHost: host,
+    guardExpected: true,
+    guardBridgeRegistration: host.getValidatedRegistrationSnapshot(),
+    guardRegistrationSnapshot: host.getResourceEnrollmentSnapshotIdentity(),
+    guardChildContext,
   };
 }
+
 
 function resolvedSkill() {
   return {
@@ -128,8 +159,7 @@ describe("preloaded child resource enrollment", () => {
     const run = runAgent(ctx(), "scope-child", "child task", {
       pi: makePi().pi,
       agentId: "child-record-42",
-      guardBridgeHost: host,
-      guardExpected: true,
+      ...guardedRunnerOptions(host),
     });
     await enrollmentStarted;
     await new Promise((resolve) => setTimeout(resolve, 10));
@@ -186,8 +216,7 @@ describe("preloaded child resource enrollment", () => {
 
     await runAgent(ctx(), "scope-child", "child task", {
       pi: makePi().pi,
-      guardBridgeHost: host,
-      guardExpected: true,
+      ...guardedRunnerOptions(host),
     });
 
     const agentDefinition = enrollments.find((value) => value.kind === "agent-definition");
@@ -205,8 +234,7 @@ describe("preloaded child resource enrollment", () => {
     await runAgent(ctx(), "scope-child", "child task", {
       pi: makePi().pi,
       agentId: "child-record-43",
-      guardBridgeHost: host,
-      guardExpected: true,
+      ...guardedRunnerOptions(host),
     });
 
     expect(enrollResource).toHaveBeenCalledWith(expect.objectContaining({
@@ -231,8 +259,7 @@ describe("preloaded child resource enrollment", () => {
     await runAgent(ctx(), "scope-child", "child task", {
       pi: makePi().pi,
       agentId: "child-record-44",
-      guardBridgeHost: host,
-      guardExpected: true,
+      ...guardedRunnerOptions(host),
     });
 
     const skill = enrollmentEvents.find((value) => value.kind === "skill");
@@ -270,8 +297,7 @@ describe("preloaded child resource enrollment", () => {
 
     const run = runAgent(ctx(), "scope-child", "child task", {
       pi: makePi().pi,
-      guardBridgeHost: host,
-      guardExpected: true,
+      ...guardedRunnerOptions(host),
     });
     await enrollmentStarted;
     host.unregister();
@@ -302,8 +328,7 @@ describe("preloaded child resource enrollment", () => {
 
     const run = runAgent(ctx(), "scope-child", "child task", {
       pi: makePi().pi,
-      guardBridgeHost: host,
-      guardExpected: true,
+      ...guardedRunnerOptions(host),
     });
     await enrollmentStarted;
     host.unregister();
@@ -334,10 +359,11 @@ describe("preloaded child resource enrollment", () => {
 
     await expect(runAgent(ctx(), "scope-child", "child task", {
       pi: makePi().pi,
-      guardBridgeHost: host,
-      guardExpected: true,
-    })).rejects.toMatchObject({ name: "GuardBridgeRejection", reasonCode: "guard-missing", entryPath: "agent-manager.spawn" });
+      ...guardedRunnerOptions(host),
+
+    })).rejects.toMatchObject({ name: "GuardBridgeRejection", reasonCode: "guard-child-injection-failed", entryPath: "agent-manager.spawn" });
     expect(session.prompt).not.toHaveBeenCalled();
+
     expect(session.dispose).toHaveBeenCalledTimes(1);
   });
 
@@ -356,8 +382,7 @@ describe("preloaded child resource enrollment", () => {
     const controller = new AbortController();
     const run = runAgent(ctx(), "scope-child", "child task", {
       pi: makePi().pi,
-      guardBridgeHost: host,
-      guardExpected: true,
+      ...guardedRunnerOptions(host),
       signal: controller.signal,
     });
     await enrollmentStarted;
@@ -405,8 +430,7 @@ describe("preloaded child resource enrollment", () => {
     host.register(registration(() => {}));
     await runAgent(ctx(), "scope-child", "initial task", {
       pi: makePi().pi,
-      guardBridgeHost: host,
-      guardExpected: true,
+      ...guardedRunnerOptions(host),
     });
     const promptsBefore = session.prompt.mock.calls.length;
     session.subscribe.mockImplementationOnce(() => {
@@ -414,7 +438,7 @@ describe("preloaded child resource enrollment", () => {
       return () => {};
     });
 
-    await expect(resumeAgent(session, "resume task", { guardBridgeHost: host, guardExpected: true }))
+    await expect(resumeAgent(session, "resume task", { ...guardedRunnerOptions(host) }))
       .rejects.toMatchObject({ name: "GuardBridgeRejection", reasonCode: "guard-missing", entryPath: "agent-manager.resume" });
     expect(session.prompt).toHaveBeenCalledTimes(promptsBefore);
   });
@@ -480,8 +504,7 @@ describe("preloaded child resource enrollment", () => {
 
     await expect(runAgent(ctx(), "scope-child", "child task", {
       pi: makePi().pi,
-      guardBridgeHost: host,
-      guardExpected: true,
+      ...guardedRunnerOptions(host),
     })).rejects.toMatchObject({
       name: "GuardBridgeRejection",
       reasonCode: "guard-enrollment-failed",
@@ -512,39 +535,35 @@ describe("preloaded child resource enrollment", () => {
     }));
     await runAgent(ctx(), "scope-child", "child task", {
       pi: makePi().pi,
-      guardBridgeHost: host,
-      guardExpected: true,
+      ...guardedRunnerOptions(host),
     });
     const enrollCount = enrollResource.mock.calls.length;
-    await resumeAgent(session, "resume child task", { guardBridgeHost: host, guardExpected: true });
+    await resumeAgent(session, "resume child task", { ...guardedRunnerOptions(host) });
     expect(enrollResource).toHaveBeenCalledTimes(enrollCount);
     expect(events.slice(-2)).toEqual(["prompt", "tool-dispatch"]);
   });
 
-  it("re-enrolls preloads for a new registration but remains idempotent for the same registration", async () => {
+  it("reuses an injected guard on same-snapshot resume and rejects a replacement registration", async () => {
     const host = new GuardBridgeHost(true, "scope-guard");
     const firstRegistrationEnrollments = vi.fn();
     host.register(registration(firstRegistrationEnrollments));
     await runAgent(ctx(), "scope-child", "child task", {
       pi: makePi().pi,
       agentId: "child-record-registration-reload",
-      guardBridgeHost: host,
-      guardExpected: true,
+      ...guardedRunnerOptions(host),
     });
     expect(firstRegistrationEnrollments).toHaveBeenCalledTimes(2);
 
-    await resumeAgent(session, "resume under same registration", { guardBridgeHost: host, guardExpected: true });
+    await resumeAgent(session, "resume under same registration", { ...guardedRunnerOptions(host) });
     expect(firstRegistrationEnrollments).toHaveBeenCalledTimes(2);
 
     host.unregister();
     const secondRegistrationEnrollments = vi.fn();
     host.register(registration(secondRegistrationEnrollments));
-    await resumeAgent(session, "resume under replacement registration", { guardBridgeHost: host, guardExpected: true });
+    await expect(resumeAgent(session, "resume under replacement registration", { ...guardedRunnerOptions(host) }))
+      .rejects.toMatchObject({ name: "GuardBridgeRejection", reasonCode: "guard-child-injection-failed", entryPath: "agent-manager.resume" });
     expect(firstRegistrationEnrollments).toHaveBeenCalledTimes(2);
-    expect(secondRegistrationEnrollments).toHaveBeenCalledTimes(2);
-
-    await resumeAgent(session, "resume again under replacement registration", { guardBridgeHost: host, guardExpected: true });
-    expect(secondRegistrationEnrollments).toHaveBeenCalledTimes(2);
+    expect(secondRegistrationEnrollments).not.toHaveBeenCalled();
   });
 
   it("enrolls resources that were pending when an unguarded child is resumed after registration", async () => {

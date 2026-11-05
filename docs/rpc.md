@@ -10,6 +10,20 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 
 `subagents:rpc:spawn` forwards `options` to `AgentManager.spawn` — but not verbatim. The manager's `spawn` behind the RPC is `spawnTopLevel` (`src/index.ts:698-721`), which deletes internal-only fields first, and then `spawnResolved` (`src/index.ts:666-696`) overwrites the activity-tracker callbacks with its own. The full interface is `SpawnOptions` at `src/agent-manager.ts:169-303`; what a bus caller actually gets is three different things.
 
+The spawn request accepts an additive optional `scopeRef` either at the request top level or in `options.scopeRef`. It is forwarded only as a guard scope-reference hint; it is not authority. When omitted, the child-context request explicitly reports `scopeRefStatus: "unresolved"`. This addition does not change `PROTOCOL_VERSION`.
+
+```ts
+export interface RpcSpawnRequest {
+  requestId: string;
+  type: string;
+  prompt: string;
+  scopeRef?: string;
+  options?: { scopeRef?: string; [key: string]: unknown };
+}
+```
+
+
+
 **Honoured** — set these and they take effect:
 
 | Field | Type | Notes |
@@ -24,6 +38,8 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 | `isBackground` | boolean | Occupies a `maxConcurrent` slot and queues behind them. Every RPC spawn runs detached regardless; this is what decides whether it is *pooled* |
 | `bypassQueue` | boolean | Starts immediately even when the concurrency limit would queue it. The slot is still counted once running |
 | `structuredOutput` | CompiledSchema | Makes the child report through a `StructuredOutput` tool |
+| `scopeRef` | string (optional; top-level request or `options.scopeRef`) | Passed to the guard as a reference hint. Omission stays unresolved; never treated as root-human authority |
+
 | `isolation` | `"worktree"` | Temp git worktree, committed to a `pi-agent-*` branch on completion |
 | `cwd` | absolute path | The agent's tools operate here; `.pi` config still loads from the parent session's project |
 | `invocation` | AgentInvocation | Resolved snapshot used for UI display |
@@ -51,6 +67,10 @@ Four things that are not obvious from the tables:
 - **`bypassQueue` is not stripped.** Its own doc comment scopes it to the scheduler and the `/agents` generator, but a bus caller can set it and skip the `maxConcurrent` check.
 - **`structuredOutput` is documented "set only by the workflow host"** (`src/agent-manager.ts:231-234`) and is also not stripped.
 - **`signal` and the `on*` callbacks are function values.** They work only because the bus is in-process. A caller that genuinely serializes its payload cannot use them, and they arrive as `undefined` rather than failing.
+
+### Scheduled scopes are Agent-tool-only
+
+The `expires_at` and `max_runs` parameters belong to the `Agent` tool's `schedule` branch; they are not fields on `subagents:rpc:spawn`, which starts work immediately and cannot create a scheduled scope. Under `guardExpected`, the Agent tool requires the snapshotted optional `createScheduleScope` bridge callback and stores only its opaque scope ID plus fork-enforced expiry/run bounds. Defaults are 24 hours and 100 runs; caller values can only narrow these limits. See [Guard bridge scheduled scopes](guard-bridge.md#bounded-scheduled-scopes-and-headless-roots-task-55) for disk-import and headless behavior.
 
 ### Names that look right and are not
 
@@ -136,9 +156,21 @@ One related thing that lives nowhere else: on every top-level settle, pi-subagen
 | Member | Signature | Notes |
 |---|---|---|
 | `waitForAll()` | `() => Promise<void>` | Resolves when nothing is running. **All** agents, including ones you did not spawn — a shutdown barrier, not a join |
+
 | `hasRunning()` | `() => boolean` | |
-| `spawn(pi, ctx, type, prompt, options)` | `=> string` normally; `Promise<string>` when a registered guard's `captureIngress` returns a promise | **Is** `spawnTopLevel`, so the strip list above applies identically. With no registration / optional guard-off capture, the return remains a synchronous string. |
+| `spawn(pi, ctx, type, prompt, options)` | `=> string` normally; `Promise<string>` when a registered guard's `captureIngress` returns a promise | `options.scopeRef` is an optional guard reference hint; omission remains unresolved. **Is** `spawnTopLevel`, so the strip list above applies identically. With no registration / optional guard-off capture, the return remains a synchronous string. |
 | `getRecord(id)` | `=> AgentRecord \| undefined` | Filtered through `isTopLevelAgent`, so someone else's child comes back `undefined` rather than leaking |
+
+```ts
+export interface ManagerRegistrySpawnOptions {
+  scopeRef?: string;
+  [key: string]: unknown;
+}
+```
+
+
+The registry's `options` may also include optional `scopeRef` with the same unresolved-when-absent semantics as the RPC spawn request.
+
 
 The slot is claimed by the first activation only; subagent sessions re-activate this extension in the same process, and unconditionally overwriting would point the registry at a short-lived child manager whose shutdown would then delete the root session's entry ([#128](https://github.com/tintinweb/pi-subagents/pull/128)). Child activations leave it alone, and shutdown releases it only if this activation claimed it (`src/index.ts:747-750`, `:1105-1107`).
 

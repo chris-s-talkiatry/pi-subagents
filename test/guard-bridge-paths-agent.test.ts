@@ -70,19 +70,28 @@ const incompatibleMessages = {
 type EntryPath = keyof typeof missingMessages;
 type Scenario = "missing" | "incompatible" | "compatible" | "guard-off";
 
-const registration = (protocolVersion = 1): GuardBridgeRegistration => ({
-  registrant: { id: "scope-guard", version: "1" },
-  protocolVersion,
-  callbacks: {
-    captureIngress: vi.fn(),
-    enrollResource: vi.fn(),
-    createChildContext: vi.fn((value: any) => ({ ...value, bridgeRef: registration() })),
-    revalidate: vi.fn(() => "allowed"),
-    approvalSettled: vi.fn(),
-    approvalCancelled: vi.fn(),
-    approvalExpired: vi.fn(),
-  },
-});
+const registration = (protocolVersion = 1): GuardBridgeRegistration => {
+  let active: GuardBridgeRegistration;
+  active = {
+    registrant: { id: "scope-guard", version: "1" },
+    protocolVersion,
+    callbacks: {
+      captureIngress: vi.fn(),
+      enrollResource: vi.fn(),
+      createChildContext: vi.fn((request: any) => ({
+        rootId: "root", parentId: request.parentId, childId: request.childId, delegationId: request.delegationId,
+        taskId: "task", scopeRevision: 0, executionEpoch: 0, resolvedRestrictions: [], origin: request.origin, bridgeRef: active,
+      })),
+      revalidate: vi.fn(() => "allowed"),
+      approvalSettled: vi.fn(),
+      approvalCancelled: vi.fn(),
+      approvalExpired: vi.fn(),
+    },
+    createChildGuardExtension: vi.fn(() => vi.fn()),
+
+  };
+  return active;
+};
 
 function fakeSession(turnsOnPrompt = 0) {
   const listeners = new Set<(event: any) => void>();
@@ -184,14 +193,15 @@ async function createRecord(
   manager: AgentManager,
   pi: any,
   extensionCtx: any,
-  options: { parentAgentId?: string } = {},
+  options: { parentAgentId?: string; guarded?: boolean } = {},
 ) {
-  manager.setGuardExpected(false);
+  const { guarded, ...spawnOptions } = options;
+  if (!guarded) manager.setGuardExpected(false);
   const id = manager.spawn(pi, extensionCtx, "general-purpose", "seed prompt", {
     description: "seed record",
     isBackground: true,
     isolated: true,
-    ...options,
+    ...spawnOptions,
   });
   await manager.awaitStartup(id);
   const record = manager.getRecord(id);
@@ -264,10 +274,11 @@ describe("real agent entry handlers require guard registration", () => {
     async (entryPath) => {
       for (const scenario of ["missing", "incompatible", "compatible", "guard-off"] as const) {
         const { pi, tools, manager, extensionCtx } = bootExtension(false);
-        const record = await createRecord(manager, pi, extensionCtx);
+        if (scenario === "compatible") configureScenario(manager, scenario);
+        const record = await createRecord(manager, pi, extensionCtx, { guarded: scenario === "compatible" });
         if (entryPath === "agent-tool.steer") record.status = "running";
         else record.status = "completed";
-        configureScenario(manager, scenario);
+        if (scenario !== "compatible") configureScenario(manager, scenario);
         const before = snapshotRecord(record);
         const promptsBefore = nextSession!.session.prompt.mock.calls.length;
         const steersBefore = nextSession!.session.steer.mock.calls.length;
@@ -323,16 +334,39 @@ describe("real agent entry handlers require guard registration", () => {
   ] as const)("%s gates the real nested tool handler for all registration states", async (entryPath, mode) => {
     for (const scenario of ["missing", "incompatible", "compatible", "guard-off"] as const) {
       const { pi, manager, extensionCtx } = bootExtension(false);
+      if (scenario === "compatible") configureScenario(manager, scenario);
+      else manager.setGuardExpected(false);
+
+      const parentAgentId = manager.spawn(pi, extensionCtx, "general-purpose", "nested parent", {
+        description: "nested parent",
+        isBackground: true,
+      });
+      await manager.awaitStartup(parentAgentId);
+      await manager.getRecord(parentAgentId)!.promise;
+
       let record: any;
       if (mode === "resume" || mode === "steer") {
-        record = await createRecord(manager, pi, extensionCtx, { parentAgentId: "parent-agent" });
+        if (scenario === "compatible") {
+          const childId = manager.spawn(pi, extensionCtx, "general-purpose", "nested record", {
+            description: "nested record",
+            isBackground: true,
+            parentAgentId,
+          });
+          await manager.awaitStartup(childId);
+          await manager.getRecord(childId)!.promise;
+          record = manager.getRecord(childId);
+        } else {
+          record = await createRecord(manager, pi, extensionCtx, { parentAgentId });
+        }
         record.status = mode === "steer" ? "running" : "completed";
       }
-      configureScenario(manager, scenario);
+      if (scenario === "missing" || scenario === "incompatible") configureScenario(manager, scenario);
+
       const tools = createNestedSubagentTools({
         manager,
         pi,
-        parentAgentId: "parent-agent",
+        parentAgentId,
+
         depth: 1,
         maxSubagentDepth: 2,
         allowedSubagents: "all",
@@ -373,7 +407,7 @@ describe("real agent entry handlers require guard registration", () => {
           await vi.waitFor(() => expect(sessionMocks.createAgentSession).toHaveBeenCalledTimes(createsBefore + 1));
           expect(manager.listAgents()).toHaveLength(beforeRecords.length + 1);
         } else if (mode === "resume") {
-          expect(manager.listAgents().map((item) => item.id)).toEqual(beforeRecords);
+          expect(manager.listAgents().map((item) => item.id).sort()).toEqual([...beforeRecords].sort());
           expect(record.session.prompt).toHaveBeenCalledTimes(promptsBefore + 1);
         } else {
           expect(manager.listAgents().map((item) => item.id)).toEqual(beforeRecords);
@@ -445,6 +479,19 @@ describe("real agent entry handlers require guard registration", () => {
       if (scenario === "compatible") host.register(bridgeRegistration);
       nextSession = fakeSession(1);
       nextSession.session.steer.mockImplementation(async () => { events.push("steer"); });
+      const childContext = scenario === "compatible" ? Object.freeze({
+        rootId: "root-id",
+        parentId: "parent-id",
+        childId: "child-id",
+        delegationId: "delegation-id",
+        taskId: "task-id",
+        scopeRevision: 3,
+        executionEpoch: 2,
+        resolvedRestrictions: [],
+        origin: "parent-model-delegation" as const,
+        bridgeRef: bridgeRegistration,
+      }) : undefined;
+
       sessionMocks.createAgentSession.mockImplementationOnce(async () => ({ session: nextSession!.session }));
       const prompt = nextSession.session.prompt;
       const run = runAgent(ctx(), "general-purpose", "turn-limit prompt", {
@@ -452,6 +499,12 @@ describe("real agent entry handlers require guard registration", () => {
         isolated: true,
         maxTurns: 1,
         guardBridgeHost: host,
+        guardExpected: host.guardExpected,
+        guardBridgeRegistration: host.getValidatedRegistrationSnapshot(),
+        guardRegistrationSnapshot: host.getResourceEnrollmentSnapshotIdentity(),
+
+        ...(childContext ? { guardChildContext: childContext } : {}),
+
       });
       if (scenario === "missing" || scenario === "incompatible") {
         await expect(run).rejects.toMatchObject({
@@ -476,6 +529,10 @@ describe("real agent entry handlers require guard registration", () => {
             coverage: "complete",
             origin: "package-system-control",
             entryPath: "agent-runner.turn-limit-steer",
+            childId: "child-id",
+            delegationId: "delegation-id",
+            parentId: "parent-id",
+
           }));
           expect(events).toEqual(["capture", "steer"]);
         }
@@ -497,6 +554,21 @@ describe("real agent entry handlers require guard registration", () => {
       isolated: true,
       maxTurns: 1,
       guardBridgeHost: host,
+      guardBridgeRegistration: host.getValidatedRegistrationSnapshot(),
+      guardRegistrationSnapshot: host.getResourceEnrollmentSnapshotIdentity(),
+      guardChildContext: Object.freeze({
+        rootId: "root-id",
+        parentId: "parent-id",
+        childId: "child-id",
+        delegationId: "delegation-id",
+        taskId: "task-id",
+        scopeRevision: 3,
+        executionEpoch: 2,
+        resolvedRestrictions: [],
+        origin: "parent-model-delegation",
+        bridgeRef: bridgeRegistration,
+      }),
+
       guardExpected: true,
     });
     await expect(run).resolves.toMatchObject({ steered: true });
@@ -542,7 +614,24 @@ describe("real agent entry handlers require guard registration", () => {
         expect(spawn.mock.calls[0][4]).toMatchObject({ guardEntryPath: "agents-command.generate-definition" });
         expect(manager.listAgents()).toHaveLength(1);
         expect(sessionMocks.createAgentSession).toHaveBeenCalledTimes(createsBefore + 1);
-        if (scenario === "compatible") expect(spawn).toHaveBeenCalledTimes(1);
+        if (scenario === "compatible") {
+          expect(spawn).toHaveBeenCalledTimes(1);
+          const active = manager.guardBridgeHost.getRegistration()!;
+          const request = (active.callbacks.createChildContext as ReturnType<typeof vi.fn>).mock.calls[0][0];
+          const ingress = (active.callbacks.captureIngress as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0];
+          expect(request).toMatchObject({
+            childId: manager.listAgents()[0].id,
+            parentId: "root:s1",
+            origin: "human",
+            entryPath: "agents-command.generate-definition",
+            operation: "spawn",
+            ingressId: ingress.ingressId,
+            inheritContext: false,
+            isolatedExtensions: false,
+            worktree: false,
+            scopeRefStatus: "not-applicable",
+          });
+        }
       }
     },
   );
