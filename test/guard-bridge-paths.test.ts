@@ -472,14 +472,15 @@ describe("guard registration at real entry paths", () => {
     expect(Object.getOwnPropertySymbols(globalThis)).toEqual(beforeSymbols);
 
     const readyCalls = bus.emit.mock.calls.filter(([event]) => event === "subagents:ready");
-    expect(readyCalls).toHaveLength(2);
+    expect(readyCalls).toHaveLength(3);
     const readyAdvertisement = (readyCalls.at(-1)![1] as any).guardBridge;
     expect(readyAdvertisement).toMatchObject({
       protocol: "pi-subagents.guard-bridge",
       protocolVersion: 1,
       outcomes: ["allowed", "approval-needed", "stopped", "denied", "dismissed", "cancelled", "unavailable", "ui-error"],
-      registrationRejected: expect.stringContaining("received 999"),
     });
+    expect(readyAdvertisement).not.toHaveProperty("registrationRejected");
+    expect(readyAdvertisement.registrationRejectionHistory).toEqual(expect.arrayContaining([expect.stringContaining("received 999")]));
     const reply = vi.fn();
     bus.on("subagents:rpc:guard-bridge:reply:read-only", reply);
     bus.emit("subagents:rpc:guard-bridge", { requestId: "read-only" });
@@ -521,7 +522,7 @@ describe("guard registration at real entry paths", () => {
     opened.bus.emit("subagents:guard:register", afterSwitch);
     expect(opened.manager.guardBridgeHost.getRegistration()).toBeUndefined();
     expect(opened.manager.guardBridgeHost.getRegistrationRejected()).toContain("no active session");
-    expect(opened.bus.emit.mock.calls.filter(([event]) => event === "subagents:ready")).toHaveLength(1);
+    expect(opened.bus.emit.mock.calls.filter(([event]) => event === "subagents:ready")).toHaveLength(2);
 
     await opened.lifecycle.get("session_start")({}, ctx());
     const restarted = { ...registration };

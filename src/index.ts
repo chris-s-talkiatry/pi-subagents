@@ -699,34 +699,55 @@ export default function (pi: ExtensionAPI) {
 
   let guardRegistrationWindowActive = false;
   let guardReadyEmitted = false;
-  let reemittingReadyForRejectedRegistration = false;
-  let rejectedReadyEmissionsThisSession = 0;
+  let reemittingReadyForRegistrationUpdate = false;
+  let registrationReadyReemissionsThisSession = 0;
+  let advertisedRegistrationRejection: string | undefined;
   const rejectedReadyReasonsThisSession = new Set<string>();
-  const MAX_REJECTED_READY_EMISSIONS_PER_SESSION = 3;
-  const resetRejectedReadyEmissions = () => {
-    rejectedReadyEmissionsThisSession = 0;
+  const MAX_REGISTRATION_READY_REEMISSIONS_PER_SESSION = 3;
+  const resetRegistrationReadyReemissions = () => {
+    registrationReadyReemissionsThisSession = 0;
+    advertisedRegistrationRejection = undefined;
     rejectedReadyReasonsThisSession.clear();
   };
+  const emitRegistrationReady = (countTowardSessionCap: boolean) => {
+    if (countTowardSessionCap) registrationReadyReemissionsThisSession++;
+    advertisedRegistrationRejection = manager.guardBridgeHost.getRegistrationRejected();
+    const wasReemittingReady = reemittingReadyForRegistrationUpdate;
+    if (countTowardSessionCap) reemittingReadyForRegistrationUpdate = true;
+    try {
+      pi.events.emit("subagents:ready", { guardBridge: getGuardBridgeAdvertisement(manager.guardBridgeHost) });
+    } finally {
+      reemittingReadyForRegistrationUpdate = wasReemittingReady;
+    }
+  };
   pi.events.on("subagents:guard:register", (registration: unknown) => {
+    const rejectedBeforeRegistration = manager.guardBridgeHost.getRegistrationRejected();
     const result = guardRegistrationWindowActive
       ? manager.registerGuard(registration)
       : manager.rejectGuardRegistration("registration rejected because there is no active session; register after subagents:ready and before session shutdown/switch.");
     const rejectionReason = result.registrationRejected;
+    if (result.compatible && guardRegistrationWindowActive) {
+      const clearedAdvertisedRejection = rejectedBeforeRegistration !== undefined &&
+        advertisedRegistrationRejection === rejectedBeforeRegistration;
+      if (clearedAdvertisedRejection) advertisedRegistrationRejection = undefined;
+      if (
+        manager.guardBridgeHost.guardExpected &&
+        clearedAdvertisedRejection &&
+        registrationReadyReemissionsThisSession < MAX_REGISTRATION_READY_REEMISSIONS_PER_SESSION
+      ) {
+        emitRegistrationReady(true);
+      }
+      return;
+    }
     if (
       rejectionReason !== undefined &&
       guardRegistrationWindowActive &&
-      !reemittingReadyForRejectedRegistration &&
-      rejectedReadyEmissionsThisSession < MAX_REJECTED_READY_EMISSIONS_PER_SESSION &&
+      !reemittingReadyForRegistrationUpdate &&
+      registrationReadyReemissionsThisSession < MAX_REGISTRATION_READY_REEMISSIONS_PER_SESSION &&
       !rejectedReadyReasonsThisSession.has(rejectionReason)
     ) {
       rejectedReadyReasonsThisSession.add(rejectionReason);
-      rejectedReadyEmissionsThisSession++;
-      reemittingReadyForRejectedRegistration = true;
-      try {
-        pi.events.emit("subagents:ready", { guardBridge: getGuardBridgeAdvertisement(manager.guardBridgeHost) });
-      } finally {
-        reemittingReadyForRejectedRegistration = false;
-      }
+      emitRegistrationReady(true);
     }
   });
 
@@ -919,7 +940,7 @@ export default function (pi: ExtensionAPI) {
   // This also wires the RPC handlers and broadcasts readiness — on the first
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
-    resetRejectedReadyEmissions();
+    resetRegistrationReadyReemissions();
     guardRegistrationWindowActive = true;
     currentCtx = ctx;
     manager.setHeadless(!ctx.hasUI);
@@ -969,7 +990,7 @@ export default function (pi: ExtensionAPI) {
       guardReadyEmitted = true;
       // Broadcast readiness after every real session_start so extensions can
       // discover and register after a switch. Filtered sessions never arrive here.
-      pi.events.emit("subagents:ready", { guardBridge: getGuardBridgeAdvertisement(manager.guardBridgeHost) });
+      emitRegistrationReady(false);
     }
     if (isSchedulingEnabled() && !scheduler.isActive()) startScheduler(ctx);
     // Stack `@handle` suggestions on pi's built-in autocomplete. Registered at
@@ -1348,7 +1369,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_before_switch", () => {
     guardRegistrationWindowActive = false;
     guardReadyEmitted = false;
-    resetRejectedReadyEmissions();
+    resetRegistrationReadyReemissions();
     manager.clearCompleted(true);
     manager.unregisterGuard();
     scheduler.stop();
@@ -1366,7 +1387,7 @@ export default function (pi: ExtensionAPI) {
     currentCtx = undefined;
     guardRegistrationWindowActive = false;
     guardReadyEmitted = false;
-    resetRejectedReadyEmissions();
+    resetRegistrationReadyReemissions();
     manager.unregisterGuard();
     // Only release the global slot if this activation claimed it — a child
     // session's shutdown must not delete the root session's registry entry.
