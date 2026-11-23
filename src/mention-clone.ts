@@ -65,13 +65,20 @@ import type { Model } from "@earendil-works/pi-ai";
 import {
   buildSessionContext,
   createAgentSession,
+  createEventBus,
+  DefaultResourceLoader,
   type ExtensionContext,
+  getAgentDir,
   SessionManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { shutdownChildSession } from "./agent-manager.js";
 import { runInChildSessionContext } from "./child-context.js";
+import { type GuardBridgeHost, type GuardBridgeRegistration, GuardBridgeRejection, type GuardChildContext, getGuardChildContext, MENTION_CLONE_PARENT_CONTEXT, markGuardChildContext, type PreparedGuardChildInjection } from "./guard-bridge.js";
 import { agentMentionReminder } from "./mention.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
+
+
 
 export interface MentionCloneOptions {
   /** The MAIN session's context — what the spawn is attributed to, and the
@@ -83,6 +90,14 @@ export interface MentionCloneOptions {
   message: string;
   /** The registered `Agent` tool, reused so the spawn is an ordinary one. */
   agentTool: ToolDefinition;
+  /** Guard context for this ephemeral in-memory session. */
+  /** Guard context for this ephemeral in-memory session. */
+  guardChildContext?: GuardChildContext;
+  guardExpected?: boolean;
+  guardBridgeHost?: GuardBridgeHost;
+  guardBridgeRegistration?: GuardBridgeRegistration;
+  guardRegistrationSnapshot?: object;
+  guardChildInjection?: PreparedGuardChildInjection;
 }
 
 export interface MentionCloneResult {
@@ -99,6 +114,24 @@ export interface MentionCloneResult {
  */
 export async function runMentionClone(opts: MentionCloneOptions): Promise<MentionCloneResult> {
   const { ctx, type, message, agentTool } = opts;
+  const guardChildMode = opts.guardExpected === true;
+  const injectionFailure = () => new GuardBridgeRejection(
+    "guard-child-injection-failed",
+    "mention.input-clone",
+    "guard-child-injection-failed: guarded work is unavailable at mention.input-clone; child guard injection could not be prepared.",
+  );
+  if (guardChildMode) {
+    if (
+      !opts.guardBridgeHost || !opts.guardRegistrationSnapshot || !opts.guardBridgeRegistration ||
+      !opts.guardChildContext || !opts.guardChildInjection ||
+      opts.guardBridgeRegistration !== opts.guardBridgeHost.getValidatedRegistrationSnapshot()
+    ) return { spawned: false, error: injectionFailure().message };
+    try {
+      opts.guardBridgeHost.assertChildInjectionSnapshot(opts.guardRegistrationSnapshot, "mention.input-clone");
+    } catch {
+      return { spawned: false, error: injectionFailure().message };
+    }
+  }
 
   let spawned = false;
   const cloneAgentTool: ToolDefinition = {
@@ -125,7 +158,9 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
         { ...(params as Record<string, unknown>), run_in_background: true } as typeof params,
         signal,
         onUpdate,
-        ctx,
+        ctx && opts.guardChildContext
+          ? Object.assign(Object.create(ctx), { [MENTION_CLONE_PARENT_CONTEXT]: opts.guardChildContext }) as ExtensionContext
+          : ctx,
       );
     },
   };
@@ -146,6 +181,33 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
     // the settings level instead, which is what a session that never ran
     // `/think` is on anyway. Same shim shape as `modelRuntime` below.
     const thinkingLevel = (ctx as { thinkingLevel?: ThinkingLevel }).thinkingLevel;
+    const cloneEventBus = guardChildMode ? createEventBus() : undefined;
+    if (cloneEventBus && opts.guardChildContext) markGuardChildContext(cloneEventBus, opts.guardChildContext);
+    if (cloneEventBus && getGuardChildContext(cloneEventBus)?.childId !== opts.guardChildContext?.childId) throw injectionFailure();
+
+    const resourceLoader = guardChildMode
+      ? new DefaultResourceLoader({
+          cwd: ctx.cwd,
+          agentDir: getAgentDir(),
+          ...(cloneEventBus ? { eventBus: cloneEventBus } : {}),
+          extensionFactories: [{
+            name: "guard-child-injection",
+            factory: opts.guardChildInjection!.extensionFactory,
+            hidden: true,
+          }],
+        })
+      : undefined;
+    if (resourceLoader) {
+      await runInChildSessionContext(() => resourceLoader.reload());
+      opts.guardBridgeHost!.assertChildInjectionSnapshot(opts.guardRegistrationSnapshot, "mention.input-clone");
+      const inlineGuardExtensions = resourceLoader.getExtensions().extensions.filter(
+        extension => extension.path === "<inline:guard-child-injection>",
+      );
+      if (
+        inlineGuardExtensions.length !== 1 ||
+        resourceLoader.getExtensions().extensions.at(-1)?.path !== "<inline:guard-child-injection>"
+      ) throw injectionFailure();
+    }
     const created = await runInChildSessionContext(() =>
       createAgentSession({
         cwd: ctx.cwd,
@@ -166,9 +228,17 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
         // agent-runner's `tools: sessionTools` beside its nested `customTools`.
         tools: [cloneAgentTool.name],
         customTools: [cloneAgentTool],
+        ...(resourceLoader ? { resourceLoader } : {}),
       } as Parameters<typeof createAgentSession>[0]),
     );
     session = created.session;
+    if (guardChildMode) {
+      opts.guardBridgeHost!.assertChildInjectionSnapshot(opts.guardRegistrationSnapshot, "mention.input-clone");
+      (session.agent.state as typeof session.agent.state & { guardChildContext?: GuardChildContext }).guardChildContext = opts.guardChildContext;
+      await session.bindExtensions({});
+      opts.guardBridgeHost!.assertChildInjectionSnapshot(opts.guardRegistrationSnapshot, "mention.input-clone");
+    }
+
 
     // The clone rebuilds a system prompt from cwd and agentDir, which is close
     // but not the live one — extensions contribute to it per turn. Copy the
@@ -187,7 +257,8 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
   } catch (err) {
     return { spawned, error: err instanceof Error ? err.message : String(err) };
   } finally {
-    session?.dispose?.();
+    if (guardChildMode) await shutdownChildSession(session);
+    else session?.dispose?.();
   }
 
   return spawned

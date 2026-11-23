@@ -1,0 +1,5 @@
+{
+  "event": ["id", "type", "description", "result", "error", "status", "toolUses", "durationMs", "tokens", "usage"],
+  "details": ["id", "description", "status", "toolUses", "turnCount", "maxTurns", "totalTokens", "totalCost", "durationMs", "outputFile", "error", "resultPreview"],
+  "appendEntry": ["id", "type", "description", "status", "result", "error", "startedAt", "completedAt"]
+}

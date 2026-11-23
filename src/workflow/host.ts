@@ -36,6 +36,7 @@ import { existsSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentManager } from "../agent-manager.js";
 import { getAgentConfig, resolveSpawnType } from "../agent-types.js";
+import { GuardBridgeRejection, type GuardChildContext, type GuardEffectDescription, type GuardIngressEvidence, type GuardOrigin } from "../guard-bridge.js";
 import { resolveModel } from "../model-resolver.js";
 import { checkModelScope } from "../model-scope.js";
 import type { AgentRecord, ThinkingLevel } from "../types.js";
@@ -67,6 +68,10 @@ export interface WorkflowHostOptions {
    * reports for them, and it has its own concurrency cap.
    */
   workflowId?: string;
+  /** Origin inherited by workflow worker launches (CLI workflows are imported context). */
+  guardOrigin?: GuardOrigin;
+  guardParentContext?: GuardChildContext;
+
   gateTimeoutMs?: number;
 }
 
@@ -174,8 +179,42 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
    * and the pre-cleanup hook both come through here — so "gate passed" is
    * decided from one behaviour, whichever route the command took.
    */
-  async function executeGate(command: string, cwd: string): Promise<WorkflowGateResult> {
+  async function executeGate(command: string, cwd: string, workflowAgentId?: string): Promise<WorkflowGateResult> {
     manager.assertGuard?.("workflow.pi-exec.gate");
+    if (manager.guardBridgeHost?.guardExpected === true) {
+      const childId = workflowAgentId ? records.get(workflowAgentId) : undefined;
+      const childRecord = childId ? manager.getRecord?.(childId) : undefined;
+      const effect: GuardEffectDescription = {
+        kind: "workflow-exec",
+        command: GATE_SHELL[0],
+        argv: Object.freeze([GATE_SHELL[1], command]),
+        cwd,
+        envKeys: Object.freeze(Object.keys(process.env).sort()),
+        resources: Object.freeze({
+          parentWorkspace: ctx.cwd,
+          ...(childRecord?.worktree ? {
+            worktreePath: childRecord.worktree.path,
+            branch: childRecord.worktree.branch,
+          } : {}),
+        }),
+        ownedByPackage: false,
+        boundTo: "unbounded",
+      };
+      const snapshot = manager.getGuardEffectSnapshot?.(childId);
+      try {
+        await manager.reviewGuardEffect(effect, {
+          entryPath: "workflow.pi-exec.gate",
+          ...(childId ? { childId } : {}),
+          snapshot,
+          ...(deps.signal ? { signal: deps.signal } : {}),
+        });
+        manager.assertGuardEffectSnapshotActive?.(snapshot, "workflow.pi-exec.gate");
+      } catch (error) {
+        const code = error instanceof GuardBridgeRejection ? error.reasonCode : "guard-effect-unavailable";
+        return { ok: false, output: code };
+      }
+      if (deps.signal?.aborted) return { ok: false, output: "guard-effect-cancelled" };
+    }
     const result = await pi.exec(GATE_SHELL[0], [GATE_SHELL[1], command], {
       cwd,
       timeout: deps.gateTimeoutMs ?? DEFAULT_GATE_TIMEOUT_MS,
@@ -285,13 +324,29 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
               // the child's own failure — so running it would be pure cost.
               if (spawnedId === undefined || !succeeded(manager.getRecord(spawnedId))) return;
               try {
-                gate = await executeGate(command, worktreePath);
+                gate = await executeGate(command, worktreePath, request.agentId);
               } catch (error) {
                 gate = { ok: false, output: error instanceof Error ? error.message : String(error) };
               }
             };
 
+      let ingress: GuardIngressEvidence | undefined;
       try {
+        ingress = await manager.captureIngress?.({
+          rawText: request.prompt,
+          coverage: "complete",
+          target: `session:${ctx.sessionManager?.getSessionId?.() ?? "unknown"}`,
+          origin: deps.guardOrigin ?? "parent-model-delegation",
+          entryPath: "workflow-host.spawn",
+        });
+        manager.assertIngressCaptureActive?.(ingress, "workflow-host.spawn");
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+
+
+      try {
+
         const { record } = await manager.spawnAndWait(
           pi,
           ctx,
@@ -300,6 +355,9 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
           {
             description: request.label,
             guardEntryPath: "workflow-host.spawn",
+            ...(ingress !== undefined ? { guardIngressEvidence: ingress } : {}),
+            ...(deps.guardParentContext ? { guardParentContext: deps.guardParentContext } : {}),
+
             // The stamp is what keeps this child out of the session's
             // `maxConcurrent` pool — see `occupiesPoolSlot`. The run already
             // bounds how many of its agents run at once, and counting them
@@ -369,7 +427,31 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
         return { ok: false, error: `Cannot resume "${agentId}" — it never started.` };
       }
       manager.assertGuard?.("workflow-host.resume");
-      const record = await manager.resume(id, prompt, deps.signal);
+      const existing = manager.getRecord?.(id);
+      const childContext = existing?.guardChildContext;
+      const ingress = await manager.captureIngress?.({
+        rawText: prompt,
+        coverage: "complete",
+        target: `agent:${id}`,
+        origin: deps.guardOrigin ?? "parent-model-delegation",
+        ...(childContext ? {
+          childId: childContext.childId,
+          delegationId: childContext.delegationId,
+          parentId: childContext.parentId,
+        } : {}),
+        entryPath: "workflow-host.resume",
+      });
+      manager.assertIngressCaptureActive?.(ingress, "workflow-host.resume");
+      const resumeOptions = ingress !== undefined || manager.guardBridgeHost?.guardExpected === true
+        ? {
+            guardEntryPath: "workflow-host.resume" as const,
+            ...(ingress !== undefined ? { guardIngressEvidence: ingress } : {}),
+            ...(deps.guardParentContext ? { guardParentContext: deps.guardParentContext } : {}),
+          }
+        : undefined;
+      const record = resumeOptions
+        ? await manager.resume(id, prompt, deps.signal, resumeOptions)
+        : await manager.resume(id, prompt, deps.signal);
       if (record === undefined) {
         return {
           ok: false,
@@ -400,7 +482,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
     async runGate(command, gate) {
       // The child's worktree when it had one and it survived; otherwise the
       // session's own directory, which is where a non-isolated child worked.
-      return await executeGate(command, gate.cwd ?? ctx.cwd);
+      return await executeGate(command, gate.cwd ?? ctx.cwd, gate.agentId);
     },
   };
 }

@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import type { EventBus, ExtensionFactory } from "@earendil-works/pi-coding-agent";
+
 
 
 /**
@@ -6,6 +8,75 @@ import { randomUUID } from "node:crypto";
  * This module intentionally has no process-global registry and no prompt-derived IDs.
  */
 export const GUARD_BRIDGE_PROTOCOL_VERSION = 1;
+
+/**
+ * Per-child marker attached to the resource-loader event bus. Discovered guard
+ * factories can synchronously read the validated context while they initialize.
+ */
+export const GUARD_CHILD_CONTEXT_EVENT_BUS_MARKER = Symbol("pi-subagents.guard-child-context");
+const CHILD_CONTEXT_QUERY_EVENT = "subagents:child-context-query";
+/** @deprecated Context refreshes are read from the marker; no public update event is emitted. */
+export const GUARD_CHILD_CONTEXT_UPDATED_EVENT = "subagents:child-context-updated";
+const childContextByEventBus = new WeakMap<EventBus, { publicContext: GuardChildContext }>();
+
+function publicChildContext(context: GuardChildContext): GuardChildContext {
+  const bridge = context.bridgeRef;
+  const callbacks = Object.freeze({ ...bridge.callbacks });
+  const bridgeRef: GuardBridgeRegistration = Object.freeze({
+    protocolVersion: bridge.protocolVersion,
+    registrant: Object.freeze({ ...bridge.registrant }),
+    callbacks,
+  });
+  return Object.freeze({ ...context, bridgeRef });
+}
+
+export function markGuardChildContext(eventBus: EventBus, context: GuardChildContext): void {
+  const existing = childContextByEventBus.get(eventBus);
+  if (existing) {
+    existing.publicContext = publicChildContext(context);
+  } else {
+    const state = { publicContext: publicChildContext(context) };
+    childContextByEventBus.set(eventBus, state);
+    eventBus.on(CHILD_CONTEXT_QUERY_EVENT, value => {
+      if (!value || typeof value !== "object") return;
+      const respond = Reflect.get(value, "respond") as unknown;
+      if (typeof respond === "function") respond(state.publicContext);
+    });
+    Object.defineProperty(eventBus, GUARD_CHILD_CONTEXT_EVENT_BUS_MARKER, {
+      configurable: false,
+      enumerable: false,
+      get: () => state.publicContext,
+    });
+  }
+}
+
+/** Read the current validated child context from an extension's `pi.events`. */
+export function getGuardChildContext(eventBus: EventBus): GuardChildContext | undefined {
+  try {
+    const marker = Reflect.get(eventBus, GUARD_CHILD_CONTEXT_EVENT_BUS_MARKER) as unknown;
+    // The non-configurable marker is authoritative; untrusted query responders
+    // cannot replace it with a fabricated child context.
+    if (marker !== null && typeof marker === "object") return marker as GuardChildContext;
+    let context: unknown;
+    let responded = false;
+    eventBus.emit(CHILD_CONTEXT_QUERY_EVENT, {
+      respond: (value: unknown) => {
+        // A marker-backed bus registers its responder before discovered
+        // extensions load. First response wins so later listeners cannot spoof it.
+        if (responded) return;
+        responded = true;
+        context = value;
+      },
+    });
+    return context !== null && typeof context === "object" ? context as GuardChildContext : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Private activation-local marker used only to carry a clone's parent context. */
+export const MENTION_CLONE_PARENT_CONTEXT = Symbol("pi-subagents.mention-clone-parent-context");
+
 
 export const GUARD_OUTCOMES = Object.freeze([
   "allowed",
@@ -26,6 +97,14 @@ export type GuardOrigin =
   | "package-system-control"
   | "imported-context"
   | "tool-observation";
+
+const GUARD_ORIGINS = [
+  "human", "parent-model-delegation", "extension-request", "package-system-control", "imported-context", "tool-observation",
+] as const satisfies readonly GuardOrigin[];
+
+function isGuardOrigin(value: unknown): value is GuardOrigin {
+  return typeof value === "string" && GUARD_ORIGINS.includes(value as GuardOrigin);
+}
 
 export const GUARD_BRIDGE_PROTOCOL_ADVERTISEMENT = Object.freeze({
   protocol: "pi-subagents.guard-bridge",
@@ -84,6 +163,11 @@ export type GuardEntryPathId =
   | "workflow-tool.dispatch"
   | "workflow-cli-flag.dispatch"
   | "workflow.pi-exec.gate"
+  | "worktree.create"
+  | "worktree.capture"
+  | "worktree.remove"
+  | "worktree.prune"
+  | "agent-runner.detect-env"
   | "agents-command.generate-definition"
   | "conversation-viewer.steer"
   | "fleet-viewer.steer"
@@ -125,6 +209,11 @@ export const GUARD_ENTRY_PATHS: readonly GuardEntryPathDescriptor[] = [
   { id: "workflow-tool.dispatch", operation: "dispatch", sourceLocations: ["src/index.ts: SubagentWorkflow.execute"] },
   { id: "workflow-cli-flag.dispatch", operation: "dispatch", sourceLocations: ["src/index.ts: runWorkflowFlag"] },
   { id: "workflow.pi-exec.gate", operation: "dispatch", sourceLocations: ["src/workflow/host.ts: executeGate"] },
+  { id: "worktree.create", operation: "dispatch", sourceLocations: ["src/worktree.ts: createWorktree git boundaries"] },
+  { id: "worktree.capture", operation: "dispatch", sourceLocations: ["src/worktree.ts: cleanupWorktree capture/commit boundaries"] },
+  { id: "worktree.remove", operation: "dispatch", sourceLocations: ["src/worktree.ts: removeWorktree"] },
+  { id: "worktree.prune", operation: "dispatch", sourceLocations: ["src/worktree.ts: pruneWorktrees"] },
+  { id: "agent-runner.detect-env", operation: "dispatch", sourceLocations: ["src/env.ts: detectEnv git observations"] },
   { id: "agents-command.generate-definition", operation: "spawn", sourceLocations: ["src/index.ts: showGenerateWizard"] },
   { id: "conversation-viewer.steer", operation: "steer", sourceLocations: ["src/index.ts: viewAgentConversation"] },
   { id: "fleet-viewer.steer", operation: "steer", sourceLocations: ["src/ui/fleet-list.ts: FleetList.openSelected"] },
@@ -142,9 +231,9 @@ export type GuardEntryIngressDisposition =
 
 /** Each guarded work boundary is either an ingress owner, an inner boundary, or task-5.x work. */
 export const GUARD_ENTRY_INGRESS: Readonly<Record<GuardEntryPathId, GuardEntryIngressDisposition>> = Object.freeze({
-  "agent-manager.spawn": { kind: "captured-at-outer-path", outerPaths: ["agent-tool.spawn-background", "agent-tool.spawn-foreground", "nested-agent.spawn-background", "nested-agent.spawn-foreground", "mention.input-start", "mention.input-resume", "cross-extension-rpc.spawn", "manager-registry.spawn", "agents-command.generate-definition"] },
-  "agent-manager.spawn-and-wait": { kind: "captured-at-outer-path", outerPaths: ["agent-tool.spawn-foreground", "nested-agent.spawn-foreground", "agents-command.generate-definition"] },
-  "agent-manager.resume": { kind: "captured-at-outer-path", outerPaths: ["agent-tool.resume-background", "agent-tool.resume-foreground", "nested-agent.resume", "mention.input-resume"] },
+  "agent-manager.spawn": { kind: "captured-at-outer-path", outerPaths: ["agent-tool.spawn-background", "agent-tool.spawn-foreground", "nested-agent.spawn-background", "nested-agent.spawn-foreground", "mention.input-start", "mention.input-resume", "cross-extension-rpc.spawn", "manager-registry.spawn", "agents-command.generate-definition", "workflow-host.spawn"] },
+  "agent-manager.spawn-and-wait": { kind: "captured-at-outer-path", outerPaths: ["agent-tool.spawn-foreground", "nested-agent.spawn-foreground", "agents-command.generate-definition", "workflow-host.spawn"] },
+  "agent-manager.resume": { kind: "captured-at-outer-path", outerPaths: ["agent-tool.resume-background", "agent-tool.resume-foreground", "nested-agent.resume", "mention.input-resume", "workflow-host.resume"] },
   "agent-manager.steer": { kind: "captured-at-outer-path", outerPaths: ["agent-tool.steer", "nested-agent.steer", "mention.input-steer", "conversation-viewer.steer", "fleet-viewer.steer"] },
   "agent-manager.pending-steer": { kind: "captured-at-outer-path", outerPaths: ["agent-tool.steer", "nested-agent.steer", "mention.input-steer", "conversation-viewer.steer", "fleet-viewer.steer"] },
   "agent-tool.spawn-background": { kind: "captures-ingress-here" },
@@ -166,12 +255,17 @@ export const GUARD_ENTRY_INGRESS: Readonly<Record<GuardEntryPathId, GuardEntryIn
   "workflow-tool.dispatch": { kind: "no-text-input", task: "5.x" },
   "workflow-cli-flag.dispatch": { kind: "no-text-input", task: "5.x" },
   "workflow.pi-exec.gate": { kind: "no-text-input", task: "5.x" },
+  "worktree.create": { kind: "no-text-input", task: "5.x" },
+  "worktree.capture": { kind: "no-text-input", task: "5.x" },
+  "worktree.remove": { kind: "no-text-input", task: "5.x" },
+  "worktree.prune": { kind: "no-text-input", task: "5.x" },
+  "agent-runner.detect-env": { kind: "no-text-input", task: "5.x" },
   "agents-command.generate-definition": { kind: "captures-ingress-here" },
   "conversation-viewer.steer": { kind: "captures-ingress-here" },
   "fleet-viewer.steer": { kind: "captures-ingress-here" },
   "agent-runner.turn-limit-steer": { kind: "captures-ingress-here" },
-  "workflow-host.spawn": { kind: "no-text-input", task: "5.x" },
-  "workflow-host.resume": { kind: "no-text-input", task: "5.x" },
+  "workflow-host.spawn": { kind: "captures-ingress-here" },
+  "workflow-host.resume": { kind: "captures-ingress-here" },
   "agent-tool.schedule-create": { kind: "captures-ingress-here" },
 });
 
@@ -182,6 +276,10 @@ export interface GuardIngressEvidence {
   coverage: "complete" | "partial" | "unknown";
   target: string;
   origin: GuardOrigin;
+  /** Identity of the child targeted by resume/steer or child-originated input. */
+  childId?: string;
+  delegationId?: string;
+  parentId?: string;
   entryPath: GuardEntryPathId;
 }
 
@@ -216,6 +314,8 @@ export interface GuardChildContext {
   executionEpoch: number;
   resolvedRestrictions: readonly GuardTextReference[];
   origin: GuardOrigin;
+  /** Fork-observed root UI availability; optional in legacy callback values. */
+  headless?: boolean;
   /** Retained reference; never reconstructed from prompt text or process state. */
   bridgeRef: GuardBridgeRegistration;
 }
@@ -243,20 +343,150 @@ export interface GuardApprovalResponse {
   evidenceRefs: readonly string[];
 }
 
+export type GuardEffectKind =
+  | "workflow-exec"
+  | "worktree-create"
+  | "worktree-capture"
+  | "worktree-remove"
+  | "worktree-prune"
+  | "child-git-observation";
+export type GuardEffectBoundTo = "owned-resources" | "unbounded";
+const READ_ONLY_GIT_ARGV = new Set([
+  JSON.stringify(["rev-parse", "--is-inside-work-tree"]),
+  JSON.stringify(["rev-parse", "HEAD"]),
+  JSON.stringify(["rev-parse", "--show-toplevel"]),
+  JSON.stringify(["branch", "--show-current"]),
+]);
+
+export function isForkReadOnlyGitCommand(command: string, argv: readonly string[]): boolean {
+  return command === "git" && READ_ONLY_GIT_ARGV.has(JSON.stringify(argv));
+}
+
+export interface GuardEffectResources {
+  worktreePath?: string;
+  branch?: string;
+  baseRepo?: string;
+  parentWorkspace?: string;
+}
+/** Concrete, content-minimal details supplied at the process execution boundary. */
+export interface GuardEffectDescription {
+  kind: GuardEffectKind;
+  command: string;
+  argv: readonly string[];
+  cwd: string;
+  /** Environment variable names only. Values are never part of this protocol. */
+  envKeys: readonly string[];
+  resources: GuardEffectResources;
+  ownedByPackage: boolean;
+  boundTo: GuardEffectBoundTo;
+  /** Fork-computed exact allow-list classification for deterministic read-only git inspection. */
+  readOnly?: true;
+}
+/** A frozen authorization request for one concrete fork-owned process effect. */
+export interface GuardEffectRequest extends GuardEffectDescription {
+  /** The manager issued this request from the private scheduled-fire path. */
+  scheduled?: true;
+  /** The fork observed a headless root; effect reviews are bounded accordingly. */
+  headless?: boolean;
+  /** True when envKeys was deterministically truncated to its bounded prefix. */
+  envKeysTruncated?: true;
+  /** Total number of environment key names before truncation. */
+  envKeysTotalCount?: number;
+  effectId: string;
+  entryPath: GuardEntryPathId;
+  childId?: string;
+  parentId?: string;
+  delegationId?: string;
+  ingressId?: string;
+  workflowId?: string;
+  childContext?: GuardChildContext;
+}
+export type GuardChildScopeRefStatus = "provided" | "unresolved" | "not-applicable";
+
+/** Fork-known facts supplied to the guard before it assigns authority state. */
+export interface GuardChildContextRequest {
+  childId: string;
+  parentId: string;
+  delegationId: string;
+  origin: GuardOrigin;
+  entryPath: GuardEntryPathId;
+  operation: "spawn" | "resume";
+  ingressId?: string;
+  /** Present for a nested child or an ephemeral child-run that delegates onward. */
+  parentContext?: GuardChildContext;
+  inheritContext: boolean;
+  isolatedExtensions: boolean;
+  worktree: boolean;
+  /** Fork-observed fact: the root has no supported approval UI. */
+  headless: boolean;
+  scopeRef?: string;
+  scopeRefStatus: GuardChildScopeRefStatus;
+  scheduled?: { jobId: string; runIndex: number; expiresAt: string };
+}
+
+export interface GuardChildInjection {
+  childId: string;
+  /** Fork-observed root UI availability, copied from the validated request. */
+  headless: boolean;
+  /** Per-session token; never serialized into prompts or session transcripts. */
+  token: symbol;
+}
+
+export type GuardChildGuardFactory = (
+  context: GuardChildContext,
+  injection: GuardChildInjection,
+) => ExtensionFactory | Promise<ExtensionFactory>;
+
+export interface PreparedGuardChildInjection {
+  extensionFactory: ExtensionFactory;
+  handle: GuardChildInjection;
+}
+
+
+/** Bounded schedule facts and creator provenance supplied when a guarded job is created. */
+export interface GuardScheduleScopeRequest {
+  jobId: string;
+  ingressId: string;
+  schedule: string;
+  scheduleType: "cron" | "once" | "interval";
+  nextRun: string;
+  requestedExpiresAt?: string;
+  requestedMaxRuns?: number;
+  origin: GuardOrigin;
+  parentId: string;
+  creatingChildId?: string;
+  parentContext?: GuardChildContext;
+  headless: boolean;
+}
+
+/** Guard-owned schedule token; target bindings are validated but never persisted by the fork. */
+export interface GuardScheduleScope {
+  scopeId: string;
+  expiresAt: string;
+  maxRuns: number;
+  targetBindings: readonly string[];
+}
+
 export interface GuardBridgeCallbacks {
   captureIngress(evidence: GuardIngressEvidence): void | Promise<void>;
   enrollResource(enrollment: GuardResourceEnrollment): void | Promise<void>;
-  createChildContext(context: Omit<GuardChildContext, "bridgeRef">): GuardChildContext | Promise<GuardChildContext>;
+  createChildContext(request: GuardChildContextRequest): GuardChildContext | Promise<GuardChildContext>;
   revalidate(request: GuardApprovalRequest): GuardOutcome | Promise<GuardOutcome>;
   approvalSettled(response: GuardApprovalResponse): void | Promise<void>;
   approvalCancelled(requestId: string, reason: string): void | Promise<void>;
   approvalExpired(requestId: string): void | Promise<void>;
+  /** Review one concrete fork-owned effect immediately before execution. */
+  reviewEffect?(request: GuardEffectRequest): GuardOutcome | Promise<GuardOutcome>;
+  /** Mint an explicit bounded authority reference for one scheduled task. */
+  createScheduleScope?(request: GuardScheduleScopeRequest): GuardScheduleScope | Promise<GuardScheduleScope>;
 }
 
 export interface GuardBridgeRegistration {
   protocolVersion: number;
   registrant: { id: string; version: string };
   callbacks: GuardBridgeCallbacks;
+  /** Optional factory used only by the fork for guarded child sessions. */
+  createChildGuardExtension?: GuardChildGuardFactory;
 }
 
 export type GuardBridgeRejectionCode =
@@ -265,7 +495,16 @@ export type GuardBridgeRejectionCode =
   | "guard-wrong-registrant"
   | "guard-registrant-unconfigured"
   | "guard-registrant-conflict"
-  | "guard-enrollment-failed";
+  | "guard-enrollment-failed"
+  | "guard-child-context-failed"
+  | "guard-schedule-scope-missing"
+  | "guard-schedule-scope-failed"
+  | "guard-child-injection-failed"
+  | "guard-effect-review-missing"
+  | "guard-effect-denied"
+  | "guard-effect-approval-needed"
+  | "guard-effect-cancelled"
+  | "guard-effect-unavailable";
 
 export class GuardBridgeRejection extends Error {
   readonly name = "GuardBridgeRejection";
@@ -276,6 +515,58 @@ export class GuardBridgeRejection extends Error {
     message: string,
   ) {
     super(message);
+  }
+}
+
+/** Code-configurable ceiling; defaults to ten seconds for child guard setup. */
+export const GUARD_CHILD_INJECTION_TIMEOUT_MS = 10_000;
+export const GUARD_EFFECT_REVIEW_TIMEOUT_MS = 10_000;
+/** Max time a guarded unattended schedule may spend obtaining fire-time context. */
+export const GUARD_SCHEDULE_FIRE_TIMEOUT_MS = 10_000;
+/** Schedule-scope creation is bounded independently from the prompt's lifetime. */
+export const GUARD_SCHEDULE_SCOPE_TIMEOUT_MS = 10_000;
+
+/** Bound a child injection hook even on entry paths without a caller abort signal. */
+export async function withGuardChildInjectionTimeout<T>(
+  pending: Promise<T>,
+  entryPath: GuardEntryPathId,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve(pending),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new GuardBridgeRejection(
+          "guard-child-injection-failed",
+          entryPath,
+          `guard-child-injection-failed: guarded work is unavailable at ${entryPath}; child guard injection could not be prepared.`,
+        )), GUARD_CHILD_INJECTION_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
+/** Bound scheduled fire-time child context creation even without a UI turn to release it. */
+export async function withGuardScheduleFireTimeout<T>(
+  pending: Promise<T>,
+  entryPath: GuardEntryPathId,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve(pending),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new GuardBridgeRejection(
+          "guard-child-context-failed",
+          entryPath,
+          `guard-child-context-failed: guarded work is unavailable at ${entryPath}; scheduled context was not obtained within ${GUARD_SCHEDULE_FIRE_TIMEOUT_MS}ms.`,
+        )), GUARD_SCHEDULE_FIRE_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
   }
 }
 
@@ -293,10 +584,15 @@ const REQUIRED_CALLBACKS: readonly (keyof GuardBridgeCallbacks)[] = [
   "approvalExpired",
 ];
 
+// The object identity, not the visible childId/token fields, is the capability.
+const issuedGuardChildInjectionHandles = new WeakSet<object>();
+
 interface RegistrationSnapshot {
   protocolVersion: number;
   registrant: { id: string; version: string };
   callbacks: GuardBridgeCallbacks;
+  createChildGuardExtension?: GuardChildGuardFactory;
+  registration: GuardBridgeRegistration;
 }
 
 function safeDiagnosticValue(value: unknown): string {
@@ -361,11 +657,46 @@ function snapshotRegistration(
         value: callback.bind(callbacks),
       });
     }
+    const childGuardHook = Reflect.get(value, "createChildGuardExtension") as unknown;
+    if (childGuardHook !== undefined && typeof childGuardHook !== "function") {
+      return { problem: "createChildGuardExtension must be a function when present." };
+    }
+    const createChildGuardExtension = typeof childGuardHook === "function"
+      ? childGuardHook.bind(value) as GuardChildGuardFactory
+      : undefined;
+    const reviewEffect = Reflect.get(callbacks, "reviewEffect") as unknown;
+    if (reviewEffect !== undefined && typeof reviewEffect !== "function") {
+      return { problem: "callbacks.reviewEffect must be a function when present." };
+    }
+    if (typeof reviewEffect === "function") {
+      Object.defineProperty(copiedCallbacks, "reviewEffect", {
+        configurable: false, enumerable: true, writable: false, value: reviewEffect.bind(callbacks),
+      });
+    }
+    const createScheduleScope = Reflect.get(callbacks, "createScheduleScope") as unknown;
+    if (createScheduleScope !== undefined && typeof createScheduleScope !== "function") {
+      return { problem: "callbacks.createScheduleScope must be a function when present." };
+    }
+    if (typeof createScheduleScope === "function") {
+      Object.defineProperty(copiedCallbacks, "createScheduleScope", {
+        configurable: false, enumerable: true, writable: false, value: createScheduleScope.bind(callbacks),
+      });
+    }
+    const frozenCallbacks = Object.freeze(copiedCallbacks);
+    const frozenRegistrant = Object.freeze({ id, version: registrantVersion });
+    const registration: GuardBridgeRegistration = Object.freeze({
+      protocolVersion: version,
+      registrant: frozenRegistrant,
+      callbacks: frozenCallbacks,
+      ...(createChildGuardExtension ? { createChildGuardExtension } : {}),
+    });
     return {
       snapshot: Object.freeze({
         protocolVersion: version,
-        registrant: Object.freeze({ id, version: registrantVersion }),
-        callbacks: Object.freeze(copiedCallbacks),
+        registrant: frozenRegistrant,
+        callbacks: frozenCallbacks,
+        ...(createChildGuardExtension ? { createChildGuardExtension } : {}),
+        registration,
       }),
     };
   } catch (error) {
@@ -498,6 +829,12 @@ export class GuardBridgeHost {
     return this.registration;
   }
 
+  /** Frozen validated registration passed into child construction. */
+  getValidatedRegistrationSnapshot(): GuardBridgeRegistration | undefined {
+    return this.registrationSnapshot?.registration;
+  }
+
+
   getRegistrationRejected(): string | undefined {
     return this.registrationRejected;
   }
@@ -552,6 +889,9 @@ export class GuardBridgeHost {
       target: input.target,
       origin: input.origin,
       entryPath: input.entryPath,
+      ...(input.childId !== undefined ? { childId: input.childId } : {}),
+      ...(input.delegationId !== undefined ? { delegationId: input.delegationId } : {}),
+      ...(input.parentId !== undefined ? { parentId: input.parentId } : {}),
     });
     this.ingressSnapshots.set(evidence, snapshot);
 
@@ -587,11 +927,355 @@ export class GuardBridgeHost {
     return assertCaptureSnapshot();
   }
 
+  /**
+   * Review a frozen concrete effect through the exact registration snapshot that
+   * owned its execution path. A pending review holds its caller's existing slot
+   * and is released only by the caller's abort signal or callback settlement.
+   */
+  async reviewEffect(
+    request: GuardEffectRequest,
+    snapshot: object | undefined,
+    entryPath: GuardEntryPathId,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (!this.expected) return;
+    this.assertRegistrationSnapshotActive(snapshot, entryPath);
+    const registrationSnapshot = this.registrationSnapshot;
+    const reject = (reasonCode: GuardBridgeRejectionCode): never => {
+      throw new GuardBridgeRejection(
+        reasonCode,
+        entryPath,
+        `${reasonCode}: guarded work is unavailable at ${entryPath}; the concrete effect was not executed.`,
+      );
+    };
+    const callback = registrationSnapshot?.callbacks.reviewEffect;
+    if (typeof callback !== "function") reject("guard-effect-review-missing");
+    if (signal?.aborted) reject("guard-effect-cancelled");
 
+    const boundedReview = request.scheduled === true || request.entryPath === "scheduled-task.fire" || request.headless === true || signal === undefined;
+    const pending = Promise.resolve().then(() => callback!(request));
+    let abortListener: (() => void) | undefined;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const races: Promise<GuardOutcome>[] = [pending];
+      if (signal) {
+        races.push(new Promise<never>((_resolve, rejectAbort) => {
+          abortListener = () => rejectAbort(new GuardBridgeRejection(
+            "guard-effect-cancelled", entryPath,
+            `guard-effect-cancelled: guarded work is unavailable at ${entryPath}; the concrete effect was not executed.`,
+          ));
+          signal.addEventListener("abort", abortListener, { once: true });
+          if (signal.aborted) abortListener();
+        }));
+      }
+      if (boundedReview) {
+        races.push(new Promise<never>((_resolve, rejectTimeout) => {
+          timeout = setTimeout(() => rejectTimeout(new GuardBridgeRejection(
+            "guard-effect-unavailable", entryPath,
+            `guard-effect-unavailable: guarded work is unavailable at ${entryPath}; effect review exceeded 10 seconds.`,
+          )), GUARD_EFFECT_REVIEW_TIMEOUT_MS);
+        }));
+      }
+      const outcome = await Promise.race(races);
+      this.assertRegistrationSnapshotActive(snapshot, entryPath);
+      if (signal?.aborted) reject("guard-effect-cancelled");
+      if (!(GUARD_OUTCOMES as readonly unknown[]).includes(outcome)) reject("guard-effect-unavailable");
+      if (outcome !== "allowed") {
+        if (outcome === "denied" || outcome === "stopped") reject("guard-effect-denied");
+        if (outcome === "cancelled") reject("guard-effect-cancelled");
+        if (outcome === "approval-needed") reject("guard-effect-approval-needed");
+        reject("guard-effect-unavailable");
+      }
+    } catch (error) {
+      if (error instanceof GuardBridgeRejection) {
+        if (error.reasonCode === "guard-effect-cancelled" || error.reasonCode === "guard-effect-approval-needed") throw error;
+        if (error.reasonCode === "guard-effect-denied" || error.reasonCode === "guard-effect-review-missing" || error.reasonCode === "guard-effect-unavailable") throw error;
+      }
+      try { this.assertRegistrationSnapshotActive(snapshot, entryPath); }
+      catch { reject("guard-effect-unavailable"); }
+      reject("guard-effect-unavailable");
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      if (abortListener && signal) signal.removeEventListener("abort", abortListener);
+    }
+  }
+
+  /** Re-check the exact callback snapshot immediately before a job is persisted. */
+  assertScheduleScopeSnapshotActive(snapshot: object | undefined): void {
+    try {
+      this.assertRegistrationSnapshotActive(snapshot, "agent-tool.schedule-create");
+    } catch {
+      throw new GuardBridgeRejection(
+        "guard-schedule-scope-failed",
+        "agent-tool.schedule-create",
+        "guard-schedule-scope-failed: guarded work is unavailable at agent-tool.schedule-create; the scheduled job was not created.",
+      );
+    }
+  }
+
+  /** Mint and validate a bounded schedule scope through the frozen registration. */
+  async createScheduleScope(
+    input: GuardScheduleScopeRequest,
+    signal?: AbortSignal,
+    expectedSnapshot: object | undefined = this.registrationSnapshot,
+  ): Promise<GuardScheduleScope> {
+    const entryPath = "agent-tool.schedule-create" as const;
+    const requirement = this.requireGuard(entryPath);
+    if (!requirement.ok) throw requirement.rejection;
+    const snapshot = expectedSnapshot as RegistrationSnapshot | undefined;
+    this.assertScheduleScopeSnapshotActive(snapshot);
+    const callback = snapshot?.callbacks.createScheduleScope;
+    const reject = (reasonCode: "guard-schedule-scope-missing" | "guard-schedule-scope-failed"): never => {
+      throw new GuardBridgeRejection(
+        reasonCode,
+        entryPath,
+        `${reasonCode}: guarded work is unavailable at ${entryPath}; the scheduled job was not created.`,
+      );
+    };
+    if (typeof callback !== "function") reject("guard-schedule-scope-missing");
+    if (signal?.aborted) reject("guard-schedule-scope-failed");
+    if (
+      typeof input.jobId !== "string" || !input.jobId || input.jobId.length > 256 ||
+      typeof input.ingressId !== "string" || !input.ingressId || input.ingressId.length > 256 ||
+      typeof input.schedule !== "string" || !input.schedule || input.schedule.length > 512 ||
+      !["cron", "once", "interval"].includes(input.scheduleType) ||
+      !Number.isFinite(Date.parse(input.nextRun)) ||
+      !isGuardOrigin(input.origin) ||
+      typeof input.parentId !== "string" || !input.parentId || input.parentId.length > 256 ||
+      typeof input.headless !== "boolean" ||
+      (input.requestedExpiresAt !== undefined && (typeof input.requestedExpiresAt !== "string" || input.requestedExpiresAt.length > 128 || !Number.isFinite(Date.parse(input.requestedExpiresAt)))) ||
+      (input.requestedMaxRuns !== undefined && (!Number.isSafeInteger(input.requestedMaxRuns) || input.requestedMaxRuns < 1)) ||
+      (input.creatingChildId !== undefined && (typeof input.creatingChildId !== "string" || !input.creatingChildId || input.creatingChildId.length > 256)) ||
+      (input.parentContext !== undefined && (input.parentContext.bridgeRef !== this.registration || input.parentContext.childId !== input.creatingChildId || input.parentId !== input.parentContext.childId))
+    ) reject("guard-schedule-scope-failed");
+
+    const request = Object.freeze({
+      ...input,
+      ...(input.parentContext ? { parentContext: input.parentContext } : {}),
+    });
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let abortListener: (() => void) | undefined;
+    try {
+      const pending = Promise.resolve().then(() => callback!(request));
+      const waits: Promise<never>[] = [new Promise<never>((_resolve, rejectTimeout) => {
+        timeout = setTimeout(() => rejectTimeout(new Error("timeout")), GUARD_SCHEDULE_SCOPE_TIMEOUT_MS);
+      })];
+      if (signal) waits.push(new Promise<never>((_resolve, rejectAbort) => {
+        abortListener = () => rejectAbort(new Error("aborted"));
+        signal.addEventListener("abort", abortListener, { once: true });
+        if (signal.aborted) abortListener();
+      }));
+      const returned: unknown = await Promise.race([pending, ...waits]);
+      this.assertScheduleScopeSnapshotActive(snapshot);
+      if (signal?.aborted) reject("guard-schedule-scope-failed");
+      if (returned === null || typeof returned !== "object" || Array.isArray(returned)) reject("guard-schedule-scope-failed");
+      const value = returned as GuardScheduleScope;
+      const scopeId = value.scopeId;
+      const expiresAt = value.expiresAt;
+      const maxRuns = value.maxRuns;
+      const targetBindings = value.targetBindings;
+      if (
+        typeof scopeId !== "string" || !scopeId.trim() || scopeId.length > 512 || Buffer.byteLength(scopeId, "utf8") > 512 || scopeId.includes("\0") ||
+        typeof expiresAt !== "string" || !Number.isFinite(Date.parse(expiresAt)) ||
+        typeof maxRuns !== "number" || !Number.isSafeInteger(maxRuns) || maxRuns < 1 ||
+        !Array.isArray(targetBindings) || targetBindings.length < 1 || targetBindings.length > 128
+      ) reject("guard-schedule-scope-failed");
+      const bindings: string[] = [];
+      const bindingCount = targetBindings.length;
+      for (let index = 0; index < bindingCount; index++) {
+        const binding = targetBindings[index];
+        if (typeof binding !== "string" || !binding.trim() || binding.length > 512 || Buffer.byteLength(binding, "utf8") > 512) {
+          reject("guard-schedule-scope-failed");
+        }
+        bindings.push(binding);
+      }
+      this.assertScheduleScopeSnapshotActive(snapshot);
+      return Object.freeze({ scopeId, expiresAt, maxRuns, targetBindings: Object.freeze(bindings) });
+    } catch {
+      try { this.assertScheduleScopeSnapshotActive(snapshot); }
+      catch { return reject("guard-schedule-scope-failed"); }
+      return reject("guard-schedule-scope-failed");
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+      if (abortListener && signal) signal.removeEventListener("abort", abortListener);
+    }
+  }
+
+  /** Create an immutable, validated context through the exact active snapshot. */
+  async createChildContext(
+    input: Omit<GuardChildContextRequest, "delegationId">,
+    evidence?: GuardIngressEvidence,
+  ): Promise<GuardChildContext | undefined> {
+    const requirement = this.requireGuard(input.entryPath);
+    if (!requirement.ok) throw requirement.rejection;
+    if (!this.expected) return undefined;
+    const snapshot = evidence
+      ? (this.ingressSnapshots.get(evidence) as RegistrationSnapshot | undefined)
+      : this.registrationSnapshot;
+    if (evidence) this.assertIngressCaptureActive(evidence, input.entryPath);
+
+    if (!snapshot) return undefined;
+
+    const diagnostics = ingressCaptureDiagnostics.get(this)!;
+    const request: GuardChildContextRequest = Object.freeze({
+      ...input,
+      delegationId: `sg-del-${diagnostics.epoch}-${++diagnostics.sequence}`,
+    });
+    const fail = (): never => {
+      throw new GuardBridgeRejection(
+        "guard-child-context-failed",
+        input.entryPath,
+        `guard-child-context-failed: guarded work is unavailable at ${input.entryPath}; child context callback failed validation; child dispatch was stopped.`,
+      );
+    };
+
+    let returned: unknown;
+    try {
+      returned = await snapshot.callbacks.createChildContext(request);
+    } catch {
+      this.assertRegistrationSnapshotActive(snapshot, input.entryPath);
+      return fail();
+    }
+    this.assertRegistrationSnapshotActive(snapshot, input.entryPath);
+    if (returned === null || typeof returned !== "object" || Array.isArray(returned)) return fail();
+
+    try {
+      const value = returned as GuardChildContext;
+      // Read callback-owned properties once. In-process callbacks can return
+      // accessors/proxies, so validating one read and retaining another is not
+      // safe; all validation and copying below uses these snapshots.
+      const rootId = value.rootId;
+      const parentId = value.parentId;
+      const childId = value.childId;
+      const delegationId = value.delegationId;
+      const taskId = value.taskId;
+      const scopeRevision = value.scopeRevision;
+      const executionEpoch = value.executionEpoch;
+      const resolvedRestrictions = value.resolvedRestrictions;
+      const origin = value.origin;
+      const bridgeRef = value.bridgeRef;
+      if (
+        childId !== request.childId || parentId !== request.parentId ||
+        delegationId !== request.delegationId || origin !== request.origin ||
+        bridgeRef !== this.registration ||
+        typeof rootId !== "string" || rootId.length === 0 || rootId.length > 256 ||
+        typeof taskId !== "string" || taskId.length === 0 || taskId.length > 256 ||
+        typeof scopeRevision !== "number" || !Number.isSafeInteger(scopeRevision) || scopeRevision < 0 ||
+        typeof executionEpoch !== "number" || !Number.isSafeInteger(executionEpoch) || executionEpoch < 0 ||
+        !Array.isArray(resolvedRestrictions)
+      ) return fail();
+
+      const restrictionCount = resolvedRestrictions.length;
+      if (restrictionCount > 128) return fail();
+      let totalReferenceBytes = 0;
+      const restrictions: GuardTextReference[] = [];
+      for (let index = 0; index < restrictionCount; index++) {
+        const reference = resolvedRestrictions[index] as GuardTextReference | undefined;
+        if (!reference || typeof reference !== "object") return fail();
+        const sourceIdentity = reference.sourceIdentity;
+        const sourceVersion = reference.sourceVersion;
+        const textReference = reference.textReference;
+        if (
+          typeof sourceIdentity !== "string" || sourceIdentity.length === 0 || sourceIdentity.length > 512 ||
+          typeof sourceVersion !== "string" || sourceVersion.length === 0 || sourceVersion.length > 512 ||
+          typeof textReference !== "string"
+        ) return fail();
+        const sourceIdentityBytes = Buffer.byteLength(sourceIdentity, "utf8");
+        const sourceVersionBytes = Buffer.byteLength(sourceVersion, "utf8");
+        const textReferenceBytes = Buffer.byteLength(textReference, "utf8");
+        const entryBytes = sourceIdentityBytes + sourceVersionBytes + textReferenceBytes;
+        totalReferenceBytes += entryBytes;
+        if (
+          sourceIdentityBytes > 512 || sourceVersionBytes > 512 || textReferenceBytes > 65_536 ||
+          entryBytes > 66_560 || totalReferenceBytes > 1_048_576
+        ) return fail();
+        restrictions.push(Object.freeze({ sourceIdentity, sourceVersion, textReference }));
+      }
+      const context: GuardChildContext = Object.freeze({
+        rootId,
+        parentId: request.parentId,
+        childId: request.childId,
+        delegationId: request.delegationId,
+        taskId,
+        scopeRevision,
+        executionEpoch,
+        resolvedRestrictions: Object.freeze(restrictions),
+        origin: request.origin,
+        headless: request.headless,
+        bridgeRef: this.registration!,
+      });
+      this.assertRegistrationSnapshotActive(snapshot, input.entryPath);
+      return context;
+    } catch {
+      return fail();
+    }
+  }
+
+
+
+  /** Current frozen enrollment-registration identity, used to scope child deduplication. */
   /** Current frozen enrollment-registration identity, used to scope child deduplication. */
   getResourceEnrollmentSnapshotIdentity(): object | undefined {
     return this.registrationSnapshot;
   }
+
+  /** Fail closed if child construction no longer owns the exact validated registration. */
+  assertChildInjectionSnapshot(snapshot: object | undefined, entryPath: GuardEntryPathId): void {
+    if (!this.expected) return;
+    if (snapshot === this.registrationSnapshot && snapshot !== undefined) return;
+    throw new GuardBridgeRejection(
+      "guard-child-injection-failed",
+      entryPath,
+      `guard-child-injection-failed: guarded work is unavailable at ${entryPath}; the validated guard registration changed before child construction.`,
+    );
+  }
+
+  /** Resolve one child-mode factory from the exact frozen registration snapshot. */
+  async createChildGuardExtension(
+    context: GuardChildContext,
+    snapshot: object | undefined,
+    entryPath: GuardEntryPathId,
+  ): Promise<PreparedGuardChildInjection> {
+    this.assertChildInjectionSnapshot(snapshot, entryPath);
+    const registrationSnapshot = snapshot as RegistrationSnapshot;
+    const createFactory = registrationSnapshot.createChildGuardExtension;
+    const fail = (): never => {
+      throw new GuardBridgeRejection(
+        "guard-child-injection-failed",
+        entryPath,
+        `guard-child-injection-failed: guarded work is unavailable at ${entryPath}; child guard injection could not be prepared.`,
+      );
+    };
+    if (context.bridgeRef !== this.registration || !Object.isFrozen(context)) return fail();
+
+    if (typeof createFactory !== "function") return fail();
+    const handle: GuardChildInjection = Object.freeze({
+      childId: context.childId,
+      headless: context.headless === true,
+      token: Symbol("pi-subagents.guard-child-injection"),
+    });
+    issuedGuardChildInjectionHandles.add(handle);
+    let extensionFactory: unknown;
+    try {
+      extensionFactory = await createFactory(context, handle);
+    } catch {
+      this.assertChildInjectionSnapshot(snapshot, entryPath);
+      return fail();
+    }
+    this.assertChildInjectionSnapshot(snapshot, entryPath);
+    if (typeof extensionFactory !== "function") return fail();
+    const childFactory = extensionFactory as ExtensionFactory;
+    const capabilityCheckedFactory: ExtensionFactory = (api) => {
+      if (
+        !issuedGuardChildInjectionHandles.has(handle) ||
+        handle.childId !== context.childId ||
+        getGuardChildContext(api.events)?.childId !== handle.childId
+      ) return fail();
+      return childFactory(api);
+    };
+    return Object.freeze({ extensionFactory: capabilityCheckedFactory, handle });
+  }
+
 
   /** Assert that capture evidence is still bound to its original frozen registration. */
   assertIngressCaptureActive(evidence: GuardIngressEvidence | undefined, entryPath: GuardEntryPathId): void {

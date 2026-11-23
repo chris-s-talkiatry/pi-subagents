@@ -27,6 +27,21 @@ export interface EventBus {
   emit(event: string, data: unknown): void;
 }
 
+export interface RpcSpawnOptions {
+  /** Guard scope-reference hint; absence is unresolved, never root authority. */
+  scopeRef?: string;
+  [key: string]: unknown;
+}
+
+export interface RpcSpawnRequest {
+  requestId: string;
+  type: string;
+  prompt: string;
+  scopeRef?: string;
+  options?: RpcSpawnOptions;
+}
+
+
 /** RPC reply envelope — matches pi-mono's RpcResponse shape. */
 export type RpcReply<T = void> =
   | { success: true; data?: T }
@@ -37,7 +52,15 @@ export const PROTOCOL_VERSION = 2;
 
 /** Minimal AgentManager interface needed by the spawn/stop/consume RPCs. */
 export interface SpawnCapable {
-  spawn(pi: unknown, ctx: unknown, type: string, prompt: string, options: any): string;
+  spawn(
+    pi: unknown,
+    ctx: unknown,
+    type: string,
+    prompt: string,
+    options: any,
+    entryPath?: GuardEntryPathId,
+    ingressEvidence?: GuardIngressEvidence,
+  ): string;
   assertGuard?(entryPath: GuardEntryPathId): unknown;
   captureIngress(input: GuardIngressInput): GuardIngressEvidence | Promise<GuardIngressEvidence> | undefined;
   awaitStartup(id: string): Promise<void>;
@@ -116,14 +139,15 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
     deps.guardBridgeAdvertisement?.() ?? GUARD_BRIDGE_PROTOCOL_ADVERTISEMENT,
   );
 
-  const unsubSpawn = handleRpc<{ requestId: string; type: string; prompt: string; options?: any }>(
-    events, "subagents:rpc:spawn", async ({ type, prompt, options }) => {
+  const unsubSpawn = handleRpc<RpcSpawnRequest>(
+    events, "subagents:rpc:spawn", async ({ type, prompt, options, scopeRef }) => {
       manager.assertGuard?.("cross-extension-rpc.spawn");
       const ctx = getCtx();
       if (!ctx) throw new Error("No active session");
-      await manager.captureIngress?.({
+      const ingress = await manager.captureIngress?.({
         rawText: typeof prompt === "string" ? prompt : "",
-        // The RPC schema has no recognized scope-reference field; missing scope stays unresolved.
+        // The RPC envelope only supplies raw text and an optional scope reference.
+        // Missing scope remains unresolved; the reference is not human authority.
         coverage: typeof prompt === "string" ? "partial" : "unknown",
         target: sessionIngressTarget(ctx),
         origin: "extension-request",
@@ -137,7 +161,7 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
       // — same pattern the scheduler path already uses — so the spawned
       // agent's auth lookup doesn't crash with "No API key found for
       // undefined".
-      let normalizedOptions = options ?? {};
+      let normalizedOptions: any = options ?? {};
       // `!= null` on purpose: a JSON-forwarding caller can serialize an unset
       // field as null, and the runner reads `options.model ?? default`, so null
       // means "inherit" — not an override to resolve or scope-check.
@@ -179,8 +203,18 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
         });
         if (verdict.kind === "error") throw new Error(verdict.message);
       }
+      const requestedScopeRef = typeof scopeRef === "string" && scopeRef.trim()
+        ? scopeRef.trim()
+        : typeof normalizedOptions.scopeRef === "string" && normalizedOptions.scopeRef.trim()
+          ? normalizedOptions.scopeRef.trim()
+          : undefined;
+      if (requestedScopeRef) normalizedOptions = { ...normalizedOptions, scopeRef: requestedScopeRef };
+      else delete normalizedOptions.scopeRef;
 
-      const id = manager.spawn(pi, ctx, type, prompt, normalizedOptions);
+
+      const id = ingress !== undefined
+        ? manager.spawn(pi, ctx, type, prompt, normalizedOptions, "cross-extension-rpc.spawn", ingress)
+        : manager.spawn(pi, ctx, type, prompt, normalizedOptions);
       // With isolation: "worktree" the agent starts asynchronously — wait for
       // it, so a strict-isolation failure is still an error envelope rather
       // than an id for an agent that never ran.

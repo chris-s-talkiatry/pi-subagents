@@ -4,7 +4,10 @@
 
 import type { ThinkingLevel } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import type { GuardChildContext, GuardIngressEvidence } from "./guard-bridge.js";
 import type { LifetimeUsage } from "./usage.js";
+
+
 
 export type { ThinkingLevel };
 
@@ -178,6 +181,16 @@ export interface AgentRecord {
   startedAt: number;
   completedAt?: number;
   session?: AgentSession;
+  /** Validated guard-owned context retained for this child and forwarded into its runner session. */
+  guardChildContext?: GuardChildContext;
+
+  /** Fork-owned creation facts re-used when a fresh context is minted on resume. */
+  guardChildContextOptions?: {
+    inheritContext: boolean;
+    isolatedExtensions: boolean;
+    worktree: boolean;
+  };
+
   abortController?: AbortController;
   promise?: Promise<string>;
   /**
@@ -202,10 +215,14 @@ export interface AgentRecord {
   resultConsumed?: boolean;
   /** Steering messages queued before the session was ready. */
   pendingSteers?: string[];
+  /** Ingress evidence paired with queued steers, preserving child identity on replay. */
+  pendingSteerEvidence?: (GuardIngressEvidence | undefined)[];
   /** Worktree info if the agent is running in an isolated worktree. */
-  worktree?: { path: string; branch: string; baseSha: string; workPath: string };
+  worktree?: { path: string; branch: string; baseSha: string; workPath: string; branchCreated?: boolean };
   /** Worktree cleanup result after agent completion. */
   worktreeResult?: { hasChanges: boolean; branch?: string };
+  /** Content-free recovery coordinates when guarded cleanup leaves a worktree behind. */
+  worktreeCleanupPending?: { path: string; branch: string; branchCreated: boolean; reason: string };
   /** The tool_use_id from the original Agent tool call. */
   toolCallId?: string;
   /** Path to the streaming output transcript file. */
@@ -323,6 +340,8 @@ export interface NotificationDetails {
   outputFile?: string;
   error?: string;
   resultPreview: string;
+  /** Bounded recovery coordinates for a worktree whose guarded cleanup was refused or timed out. */
+  worktreeCleanupPending?: { path: string; branch: string; branchCreated: boolean; reason: string };
   /** Additional agents in a group notification. */
   others?: NotificationDetails[];
 }
@@ -364,7 +383,19 @@ export interface ScheduledSubagent {
   /** ISO timestamp. */
   createdAt: string;
   lastRun?: string;
-  lastStatus?: "success" | "error" | "running";
+  lastStatus?: "success" | "error" | "running" | "expired";
+  /** Opaque guard-owned scheduled scope; never treated as authority from disk. */
+  guardScopeId?: string;
+  /** Fork-enforced ISO deadline, bounded to at most 24 hours from load/create. */
+  guardExpiresAt?: string;
+  /** Fork-enforced schedule run ceiling, capped at 100. */
+  guardMaxRuns?: number;
+  /** Fork-owned count of schedule executions started. */
+  guardRunCount?: number;
+  /** Bounded reason code for a guarded schedule that cannot fire again. */
+  guardExpiryReason?: string;
+  /** Bounded bridge reason when a guarded scheduled child failed to start. */
+  guardFailureReason?: string;
   /** Refreshed on every fire and on store load. */
   nextRun?: string;
   runCount: number;

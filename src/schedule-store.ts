@@ -14,6 +14,13 @@ import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileS
 import { dirname, join } from "node:path";
 import type { ScheduledSubagent, ScheduleStoreData } from "./types.js";
 
+const SCHEDULED_JOB_FIELDS = [
+  "id", "name", "description", "schedule", "scheduleType", "intervalMs", "subagent_type", "prompt",
+  "model", "thinking", "max_turns", "isolated", "isolation", "enabled", "createdAt", "lastRun",
+  "lastStatus", "guardScopeId", "guardExpiresAt", "guardMaxRuns", "guardRunCount", "guardExpiryReason",
+  "guardFailureReason", "nextRun", "runCount",
+] as const satisfies readonly (keyof ScheduledSubagent)[];
+
 const LOCK_RETRY_MS = 50;
 const LOCK_MAX_RETRIES = 100;
 
@@ -58,10 +65,18 @@ export class ScheduleStore {
   private filePath: string;
   private lockPath: string;
   private jobs = new Map<string, ScheduledSubagent>();
+  private guardExpected: boolean;
 
-  constructor(filePath: string) {
+  constructor(filePath: string, options: { guardExpected?: boolean } = {}) {
     this.filePath = filePath;
     this.lockPath = filePath + ".lock";
+    this.guardExpected = options.guardExpected === true;
+    this.load();
+  }
+  /** Synchronize normalization mode with the scheduler's current guard boundary. */
+  setGuardExpected(guardExpected: boolean): void {
+    if (this.guardExpected === guardExpected) return;
+    this.guardExpected = guardExpected;
     this.load();
   }
 
@@ -76,13 +91,36 @@ export class ScheduleStore {
     try {
       const data: ScheduleStoreData = JSON.parse(readFileSync(this.filePath, "utf-8"));
       this.jobs.clear();
-      for (const j of data.jobs ?? []) this.jobs.set(j.id, j);
+      for (const stored of data.jobs ?? []) {
+        if (!stored || typeof stored !== "object" || Array.isArray(stored)) continue;
+        if (!this.guardExpected) {
+          const job = stored as ScheduledSubagent;
+          this.jobs.set(job.id, job);
+          continue;
+        }
+        const job = {} as ScheduledSubagent;
+        for (const key of SCHEDULED_JOB_FIELDS) {
+          if (Object.hasOwn(stored, key)) (job as any)[key] = (stored as any)[key];
+        }
+        if (typeof job.id === "string" && job.id.length > 0 && job.id.length <= 256) this.jobs.set(job.id, job);
+      }
     } catch { /* corrupt — start fresh, next save rewrites */ }
   }
 
   /** Atomic write via temp file + rename (POSIX-atomic). */
   private save(): void {
-    const data: ScheduleStoreData = { version: 1, jobs: [...this.jobs.values()] };
+    const data: ScheduleStoreData = {
+      version: 1,
+      jobs: this.guardExpected
+        ? [...this.jobs.values()].map(job => {
+            const sanitized = {} as ScheduledSubagent;
+            for (const key of SCHEDULED_JOB_FIELDS) {
+              if (Object.hasOwn(job, key)) (sanitized as any)[key] = (job as any)[key];
+            }
+            return sanitized;
+          })
+        : [...this.jobs.values()],
+    };
     const tmp = this.filePath + ".tmp";
     writeFileSync(tmp, JSON.stringify(data, null, 2));
     renameSync(tmp, this.filePath);

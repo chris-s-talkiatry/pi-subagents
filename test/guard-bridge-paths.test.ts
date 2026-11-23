@@ -58,12 +58,17 @@ const registration: GuardBridgeRegistration = {
   callbacks: {
     captureIngress: vi.fn(),
     enrollResource: vi.fn(),
-    createChildContext: vi.fn((value: any) => ({ ...value, bridgeRef: registration })),
+    createChildContext: vi.fn((request: any) => ({
+      rootId: "root", parentId: request.parentId, childId: request.childId, delegationId: request.delegationId,
+      taskId: "task", scopeRevision: 0, executionEpoch: 0, resolvedRestrictions: [], origin: request.origin, bridgeRef: registration,
+    })),
     revalidate: vi.fn(() => "allowed"),
     approvalSettled: vi.fn(),
     approvalCancelled: vi.fn(),
     approvalExpired: vi.fn(),
   },
+  createChildGuardExtension: vi.fn(() => vi.fn()),
+
 };
 
 function eventBus() {
@@ -189,7 +194,7 @@ describe("guard registration at real entry paths", () => {
     expect(opened.manager.listAgents()).toEqual([]);
   });
 
-  it("accepts the expected registrant after rejecting a wrong id and runs guarded work once", () => {
+  it("accepts the expected registrant after rejecting a wrong id and runs guarded work once", async () => {
     const manager = new AgentManager();
     manager.setGuardRegistrant("scope-guard");
     manager.setGuardExpected(true);
@@ -200,6 +205,8 @@ describe("guard registration at real entry paths", () => {
       expect(manager.registerGuard(registration)).toEqual({ compatible: true });
       const id = manager.spawn({}, {} as any, "general-purpose", "guarded request", { isBackground: true });
       expect(manager.getRecord(id)).toBeDefined();
+      await vi.waitFor(() => expect(runnerMocks.runAgent).toHaveBeenCalledTimes(1));
+
       expect(runnerMocks.runAgent).toHaveBeenCalledTimes(1);
     } finally {
       manager.dispose();
@@ -207,7 +214,7 @@ describe("guard registration at real entry paths", () => {
   });
 
 
-  it("allows manager spawn with compatible registration and with guardExpected defaulted off", () => {
+  it("allows manager spawn with compatible registration and with guardExpected defaulted off", async () => {
     const pi = {} as any;
     const manager = new AgentManager();
     try {
@@ -216,6 +223,8 @@ describe("guard registration at real entry paths", () => {
       manager.registerGuard(registration);
       const id = manager.spawn(pi, {} as any, "general-purpose", "raw prompt", { description: "compatible", isBackground: true });
       expect(manager.getRecord(id)).toBeDefined();
+      await vi.waitFor(() => expect(runnerMocks.runAgent).toHaveBeenCalledTimes(1));
+
       expect(runnerMocks.runAgent).toHaveBeenCalledTimes(1);
     } finally {
       manager.dispose();
@@ -371,13 +380,14 @@ describe("guard registration at real entry paths", () => {
       scheduler.start(pi, ctx(), manager, store);
       const job = scheduler.addJob({ name: "guarded task", description: "guarded task", schedule: "+10m", subagent_type: "general-purpose", prompt: "scheduled raw prompt" });
       (scheduler as any).executeJob(job.id);
-      expect(store.get(job.id)?.lastStatus).toBe("error");
+      expect(store.get(job.id)?.lastStatus).toBe("expired");
+      expect(store.get(job.id)?.guardExpiryReason).toBe("guard-schedule-scope-invalid");
       expect(manager.listAgents()).toEqual([]);
       expect(runnerMocks.runAgent).not.toHaveBeenCalled();
       expect(pi.events.emit).toHaveBeenLastCalledWith("subagents:scheduled", {
         type: "error",
         jobId: job.id,
-        error: "guard-missing: guarded work is unavailable at scheduled-task.fire; no guard bridge registration is present.",
+        error: "guard-schedule-scope-invalid",
       });
     } finally {
 
@@ -448,24 +458,29 @@ describe("guard registration at real entry paths", () => {
     registration.protocolVersion = 999;
     const mutatedId = manager.spawn({}, ctx(), "general-purpose", "same text", { isBackground: true });
     expect(manager.getRecord(mutatedId)).toBeDefined();
+    await vi.waitFor(() => expect(runnerMocks.runAgent).toHaveBeenCalledTimes(1));
+
     expect(runnerMocks.runAgent).toHaveBeenCalledTimes(1);
     registration.protocolVersion = originalVersion;
     bus.emit("subagents:guard:register", registration);
     const id = manager.spawn({}, ctx(), "general-purpose", "same text", { isBackground: true });
+    await vi.waitFor(() => expect(runnerMocks.runAgent).toHaveBeenCalledTimes(2));
+
     expect(manager.getRecord(id)).toBeDefined();
     expect(runnerMocks.runAgent).toHaveBeenCalledTimes(2);
     expect(Object.getOwnPropertyNames(globalThis)).toEqual(beforeNames);
     expect(Object.getOwnPropertySymbols(globalThis)).toEqual(beforeSymbols);
 
     const readyCalls = bus.emit.mock.calls.filter(([event]) => event === "subagents:ready");
-    expect(readyCalls).toHaveLength(2);
+    expect(readyCalls).toHaveLength(3);
     const readyAdvertisement = (readyCalls.at(-1)![1] as any).guardBridge;
     expect(readyAdvertisement).toMatchObject({
       protocol: "pi-subagents.guard-bridge",
       protocolVersion: 1,
       outcomes: ["allowed", "approval-needed", "stopped", "denied", "dismissed", "cancelled", "unavailable", "ui-error"],
-      registrationRejected: expect.stringContaining("received 999"),
     });
+    expect(readyAdvertisement).not.toHaveProperty("registrationRejected");
+    expect(readyAdvertisement.registrationRejectionHistory).toEqual(expect.arrayContaining([expect.stringContaining("received 999")]));
     const reply = vi.fn();
     bus.on("subagents:rpc:guard-bridge:reply:read-only", reply);
     bus.emit("subagents:rpc:guard-bridge", { requestId: "read-only" });
@@ -507,7 +522,7 @@ describe("guard registration at real entry paths", () => {
     opened.bus.emit("subagents:guard:register", afterSwitch);
     expect(opened.manager.guardBridgeHost.getRegistration()).toBeUndefined();
     expect(opened.manager.guardBridgeHost.getRegistrationRejected()).toContain("no active session");
-    expect(opened.bus.emit.mock.calls.filter(([event]) => event === "subagents:ready")).toHaveLength(1);
+    expect(opened.bus.emit.mock.calls.filter(([event]) => event === "subagents:ready")).toHaveLength(2);
 
     await opened.lifecycle.get("session_start")({}, ctx());
     const restarted = { ...registration };

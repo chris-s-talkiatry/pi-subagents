@@ -427,6 +427,12 @@ export class FleetList {
               this.manager.assertGuard?.("fleet-viewer.steer");
               const capture = this.manager.captureIngress?.({
                 rawText: message,
+                ...(record.guardChildContext ? {
+                  childId: record.guardChildContext.childId,
+                  delegationId: record.guardChildContext.delegationId,
+                  parentId: record.guardChildContext.parentId,
+                } : {}),
+
                 coverage: "complete",
                 target: `agent:${record.id}`,
                 origin: "human",
@@ -435,13 +441,15 @@ export class FleetList {
               if (capture && typeof (capture as Promise<unknown>).then === "function") {
                 void (capture as Promise<import("../guard-bridge.js").GuardIngressEvidence>).then((evidence) => {
                   this.manager.assertIngressCaptureActive(evidence, "fleet-viewer.steer");
-                  this.manager.steer(record.id, message);
+                  if (evidence) this.manager.steer(record.id, message, evidence);
+                  else this.manager.steer(record.id, message);
                 }).catch((error) => {
                   if (error instanceof GuardBridgeRejection) this.ui?.notify(error.message, "warning");
                   else console.warn("[pi-subagents] Deferred steer stopped at fleet-viewer.steer.");
                 });
               } else {
-                this.manager.steer(record.id, message);
+                if (capture) this.manager.steer(record.id, message, capture as import("../guard-bridge.js").GuardIngressEvidence);
+                else this.manager.steer(record.id, message);
               }
             } catch (error) {
               if (!(error instanceof GuardBridgeRejection)) throw error;

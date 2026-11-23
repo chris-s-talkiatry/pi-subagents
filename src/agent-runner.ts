@@ -7,11 +7,12 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
-import type { ExtensionContext, LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
+import type { EventBus, ExtensionContext, LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
 import {
   type AgentSession,
   type AgentSessionEvent,
   createAgentSession,
+  createEventBus,
   DefaultResourceLoader,
   type ExtensionAPI,
   getAgentDir,
@@ -23,7 +24,7 @@ import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
-import { type GuardBridgeHost, type GuardBridgeRegistration, GuardBridgeRejection, type GuardEntryPathId, type GuardResourceEnrollment } from "./guard-bridge.js";
+import { type GuardBridgeHost, type GuardBridgeRegistration, GuardBridgeRejection, type GuardChildContext, type GuardEffectDescription, type GuardEntryPathId, type GuardResourceEnrollment, getGuardChildContext, markGuardChildContext, type PreparedGuardChildInjection, withGuardChildInjectionTimeout } from "./guard-bridge.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
@@ -32,6 +33,9 @@ import { createStructuredCapture, createStructuredOutputTool, structuredRetryPro
 import type { AgentConfig, SubagentType, ThinkingLevel } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
+
+const sessionGuardInjectionSnapshots = new WeakMap<AgentSession, object>();
+const sessionChildEventBuses = new WeakMap<AgentSession, EventBus>();
 /**
  * Tool names registered by THIS extension. Single source of truth so the
  * registration sites (index.ts) and the subagent exclusion list below can't
@@ -354,9 +358,15 @@ export function installExtensionToolScope(
       // First alias that carries a narrowing set — a user won't narrow one
       // extension under two different names, so first-match is correct.
       const narrowed = canons.map((c) => narrowing.get(c)).find(Boolean);
+      const isInlineGuard = extension.path === "<inline:guard-child-injection>";
       for (const name of extension.tools.keys()) {
         if (narrowed && !narrowed.has(name)) continue;
         if (disallowedSet?.has(name)) continue;
+        // The injected guard may replace a tool the child already has, but it
+        // must not add its own tools to the child's effective toolset. For the
+        // inline factory, `keep` is precisely the set contributed by requested
+        // built-ins and permitted discovered extensions at this point.
+        if (isInlineGuard && !keep.has(name) && !readmitToolNames.has(name)) continue;
         keep.add(name);
       }
     }
@@ -487,12 +497,21 @@ export interface ToolActivity {
 }
 
 export interface RunOptions {
+  /** Validated guard-owned identity retained on the child runner session. */
+  guardChildContext?: GuardChildContext;
+
   /** Retained versioned guard registration passed directly from the manager. */
   guardBridgeRegistration?: GuardBridgeRegistration;
+  /** Frozen registration identity captured before this child was constructed. */
+  guardRegistrationSnapshot?: object;
+  /** Prepared exactly once by the manager for this new child session. */
   /** Root-owned guard host for internal deferred steering checks. */
   guardBridgeHost?: GuardBridgeHost;
   /** Captured at manager dispatch, so a missing host still fails closed. */
   guardExpected?: boolean;
+  /** Concrete process-boundary authorization, present only for guarded children. */
+  reviewGuardEffect?: (effect: GuardEffectDescription, entryPath: GuardEntryPathId) => Promise<void>;
+  assertGuardEffectActive?: (entryPath: GuardEntryPathId) => void;
   /** ExtensionAPI instance — used for pi.exec() instead of execSync. */
   pi: ExtensionAPI;
   /** Manager-assigned id; suffixes session name to disambiguate parallel spawns (e.g. `Explore#a1b2c3d4`). */
@@ -709,19 +728,97 @@ function resolveConfiguredSessionDir(sessionDir: string | undefined, cwd: string
   return resolve(cwd, sessionDir);
 }
 
+function childInjectionFailure(entryPath: GuardEntryPathId): GuardBridgeRejection {
+  return new GuardBridgeRejection(
+    "guard-child-injection-failed",
+    entryPath,
+    `guard-child-injection-failed: guarded work is unavailable at ${entryPath}; child guard injection could not be prepared.`,
+  );
+}
+
+type CallbackRace<T> = { aborted: true } | { aborted: false; value: T };
+
+function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<CallbackRace<T>> {
+  const observed = Promise.resolve(promise);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve({ aborted: true });
+    };
+    observed.then(
+      value => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve({ aborted: false, value });
+      },
+      error => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      },
+    );
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+
 export async function runAgent(
   ctx: ExtensionContext,
   type: SubagentType,
   prompt: string,
   options: RunOptions,
 ): Promise<RunResult> {
-  let guardRegistrationSnapshot = options.guardBridgeHost?.getResourceEnrollmentSnapshotIdentity();
+  let guardRegistrationSnapshot = options.guardRegistrationSnapshot ?? options.guardBridgeHost?.getResourceEnrollmentSnapshotIdentity();
+  let childGuardInjection: PreparedGuardChildInjection | undefined;
   if (options.guardBridgeHost) {
-    options.guardBridgeHost.assertRegistrationSnapshotActive(guardRegistrationSnapshot, "agent-manager.spawn");
+    if (options.guardExpected) {
+      options.guardBridgeHost.assertGuard("agent-manager.spawn");
+      options.guardBridgeHost.assertChildInjectionSnapshot(guardRegistrationSnapshot, "agent-manager.spawn");
+      if (
+        !options.guardChildContext ||
+        options.guardChildContext.bridgeRef !== options.guardBridgeHost.getRegistration() ||
+        options.guardBridgeRegistration !== undefined &&
+        options.guardBridgeRegistration !== options.guardBridgeHost.getValidatedRegistrationSnapshot()
+      ) throw childInjectionFailure("agent-manager.spawn");
+      const pending = options.guardBridgeHost.createChildGuardExtension(
+        options.guardChildContext,
+        guardRegistrationSnapshot,
+        "agent-manager.spawn",
+      );
+      const outcome = options.signal
+        ? await raceWithAbort(pending, options.signal)
+        : { aborted: false as const, value: await withGuardChildInjectionTimeout(pending, "agent-manager.spawn") };
+      if (outcome.aborted || options.signal?.aborted) {
+        return { responseText: "", aborted: true, steered: false };
+      }
+      childGuardInjection = outcome.value;
+    } else {
+      options.guardBridgeHost.assertRegistrationSnapshotActive(guardRegistrationSnapshot, "agent-manager.spawn");
+    }
   } else if (options.guardExpected) {
     throw new GuardBridgeRejection("guard-missing", "agent-manager.spawn",
       "guard-missing: guarded work is unavailable at agent-manager.spawn; no guard bridge host is present in runner options for resource enrollment.");
   }
+  const childEventBus = options.guardExpected ? createEventBus() : undefined;
+  if (childEventBus && options.guardChildContext) {
+    try {
+      markGuardChildContext(childEventBus, options.guardChildContext);
+    } catch {
+      throw childInjectionFailure("agent-manager.spawn");
+    }
+    if (getGuardChildContext(childEventBus)?.childId !== options.guardChildContext.childId) {
+      throw childInjectionFailure("agent-manager.spawn");
+    }
+
+  }
+
   const config = getConfig(type);
   const agentConfig = getAgentConfig(type);
 
@@ -731,7 +828,7 @@ export async function runAgent(
   // They differ only for SpawnOptions.cwd spawns (config stays with the parent).
   const configCwd = options.configCwd ?? effectiveCwd;
 
-  const env = await detectEnv(options.pi, effectiveCwd);
+  const env = await detectEnv(options.pi, effectiveCwd, options.reviewGuardEffect, options.worktreeBase ?? ctx.cwd, options.reviewGuardEffect ? options.signal : undefined, options.assertGuardEffectActive);
 
   // Get parent system prompt for append-mode agents
   const parentSystemPrompt = ctx.getSystemPrompt();
@@ -884,6 +981,8 @@ export async function runAgent(
           return {
             ...base,
             extensions: base.extensions.filter((e) => {
+              if (options.guardExpected && e.path === "<inline:guard-child-injection>") return true;
+
               const canons = extensionCanonicalNames(e.path);
               if (canons.some((n) => excludeNames.has(n))) return false; // exclude wins
               return loadAll || canons.some((n) => keepNames.has(n));
@@ -903,8 +1002,23 @@ export async function runAgent(
     noContextFiles: true,
     systemPromptOverride: () => systemPrompt,
     appendSystemPromptOverride: () => [],
+    ...(childEventBus ? { eventBus: childEventBus } : {}),
+
+    ...(options.guardExpected && childGuardInjection
+      ? { extensionFactories: [{ name: "guard-child-injection", factory: childGuardInjection.extensionFactory, hidden: true }] }
+      : {}),
   });
   await runInChildSessionContext(() => loader.reload());
+  if (options.guardExpected) {
+    options.guardBridgeHost?.assertChildInjectionSnapshot(guardRegistrationSnapshot, "agent-manager.spawn");
+    const inlineGuardExtensions = loader.getExtensions().extensions.filter(
+      extension => extension.path === "<inline:guard-child-injection>",
+    );
+    if (
+      inlineGuardExtensions.length !== 1 ||
+      loader.getExtensions().extensions.at(-1)?.path !== "<inline:guard-child-injection>"
+    ) throw childInjectionFailure("agent-manager.spawn");
+  }
 
   // Plain entries in `tools:` are expected to be built-in names (extension tools
   // go through `ext:`), so an unknown name there is unambiguously a typo. Previously
@@ -1152,9 +1266,19 @@ export async function runAgent(
     sessionOpts.thinkingLevel = thinkingLevel;
   }
 
+  if (options.guardExpected) {
+    options.guardBridgeHost?.assertChildInjectionSnapshot(guardRegistrationSnapshot, "agent-manager.spawn");
+  }
   const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
+  if (options.guardExpected && guardRegistrationSnapshot) {
+    sessionGuardInjectionSnapshots.set(session, guardRegistrationSnapshot);
+    if (childEventBus) sessionChildEventBuses.set(session, childEventBus);
+  }
   if (options.guardBridgeHost && resources.length > 0) {
     sessionResourceEnrollments.set(session, { resources, enrolledByRegistration });
+  }
+  if (options.guardExpected && options.guardChildContext && session.agent?.state) {
+    (session.agent.state as typeof session.agent.state & { guardChildContext?: GuardChildContext }).guardChildContext = options.guardChildContext;
   }
 
   const baseSessionName = agentConfig?.name ?? type;
@@ -1174,6 +1298,15 @@ export async function runAgent(
       });
     },
   });
+  if (options.guardExpected) {
+    try {
+      options.guardBridgeHost?.assertChildInjectionSnapshot(guardRegistrationSnapshot, "agent-manager.spawn");
+    } catch (error) {
+      try { session.dispose?.(); } catch { /* preserve snapshot failure */ }
+      throw error;
+    }
+  }
+
 
   // With `allowedToolNames` unset, the registry is scoped by `excludeTools` but
   // the ACTIVE set still needs managing: pi activates only its four default
@@ -1191,6 +1324,7 @@ export async function runAgent(
       readmitToolNames,
     });
   }
+
 
   try {
     options.onSessionCreated?.(session);
@@ -1231,6 +1365,12 @@ export async function runAgent(
             target: options.agentId ? `agent:${options.agentId}` : `session:${sessionId ?? "unknown"}`,
             origin: "package-system-control",
             entryPath: "agent-runner.turn-limit-steer",
+            ...(options.guardChildContext ? {
+              childId: options.guardChildContext.childId,
+              delegationId: options.guardChildContext.delegationId,
+              parentId: options.guardChildContext.parentId,
+            } : {}),
+
           });
           if (capture && typeof (capture as Promise<unknown>).then === "function") {
             const registrationSnapshot = options.guardBridgeHost?.getResourceEnrollmentSnapshotIdentity();
@@ -1369,13 +1509,26 @@ export async function resumeAgent(
     signal?: AbortSignal;
     /** Retained versioned guard registration passed directly from the manager. */
     guardBridgeRegistration?: GuardBridgeRegistration;
+    guardRegistrationSnapshot?: object;
+    guardChildContext?: GuardChildContext;
+
     guardBridgeHost?: GuardBridgeHost;
     guardExpected?: boolean;
   } = {},
 ): Promise<{ text: string; failure?: string; aborted?: boolean }> {
-  const guardRegistrationSnapshot = options.guardBridgeHost?.getResourceEnrollmentSnapshotIdentity();
+  const guardRegistrationSnapshot = options.guardRegistrationSnapshot ?? options.guardBridgeHost?.getResourceEnrollmentSnapshotIdentity();
   if (options.guardBridgeHost) {
-    options.guardBridgeHost.assertRegistrationSnapshotActive(guardRegistrationSnapshot, "agent-manager.resume");
+    if (options.guardExpected) {
+      options.guardBridgeHost.assertChildInjectionSnapshot(guardRegistrationSnapshot, "agent-manager.resume");
+      if (
+        !options.guardChildContext ||
+        options.guardChildContext.bridgeRef !== options.guardBridgeHost.getRegistration() ||
+        options.guardBridgeRegistration !== options.guardBridgeHost.getValidatedRegistrationSnapshot() ||
+        sessionGuardInjectionSnapshots.get(session) !== guardRegistrationSnapshot
+      ) throw childInjectionFailure("agent-manager.resume");
+    } else {
+      options.guardBridgeHost.assertRegistrationSnapshotActive(guardRegistrationSnapshot, "agent-manager.resume");
+    }
   } else if (options.guardExpected) {
     throw new GuardBridgeRejection("guard-missing", "agent-manager.resume",
       "guard-missing: guarded work is unavailable at agent-manager.resume; no guard bridge host is present for resource enrollment.");
@@ -1423,6 +1576,11 @@ export async function resumeAgent(
   try {
     options.guardBridgeHost?.assertRegistrationSnapshotActive(guardRegistrationSnapshot, "agent-manager.resume");
     if (options.signal?.aborted) return { text: "", aborted: true };
+    if (options.guardExpected && options.guardChildContext && session.agent?.state) {
+      (session.agent.state as typeof session.agent.state & { guardChildContext?: GuardChildContext }).guardChildContext = options.guardChildContext;
+      const childEventBus = sessionChildEventBuses.get(session);
+      if (childEventBus) markGuardChildContext(childEventBus, options.guardChildContext);
+    }
     await session.prompt(prompt);
   } finally {
     collector.unsubscribe();

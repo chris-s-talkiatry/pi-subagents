@@ -20,13 +20,13 @@ import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
-import { GuardBridgeHost, type GuardBridgeRegistration, type GuardBridgeRejectionCode, type GuardEntryPathId, type GuardIngressEvidence, type GuardIngressInput } from "./guard-bridge.js";
+import { GuardBridgeHost, type GuardBridgeRegistration, GuardBridgeRejection, type GuardBridgeRejectionCode, type GuardChildContext, type GuardChildScopeRefStatus, type GuardEffectDescription, type GuardEffectRequest, type GuardEntryPathId, type GuardIngressEvidence, type GuardIngressInput, type GuardOrigin, isForkReadOnlyGitCommand, type PreparedGuardChildInjection, withGuardChildInjectionTimeout, withGuardScheduleFireTimeout } from "./guard-bridge.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
 import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
-import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, } from "./worktree.js";
+import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, type WorktreeCleanupResult, type WorktreeEffectHooks } from "./worktree.js";
 
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
@@ -54,6 +54,19 @@ export type CompactionInfo = { reason: "manual" | "threshold" | "overflow"; toke
  * tool description tells the model to send.
  */
 const DEFAULT_MAX_CONCURRENT = 10;
+
+function recordWorktreeCleanupPending(record: AgentRecord, worktree: NonNullable<AgentRecord["worktree"]>, error: unknown): void {
+  const reason = error instanceof GuardBridgeRejection ? error.reasonCode : "cleanup-failed";
+  const pending = {
+    path: worktree.path.slice(0, 4096),
+    branch: worktree.branch.slice(0, 256),
+    branchCreated: worktree.branchCreated === true,
+    reason: reason.slice(0, 96),
+  };
+  record.worktreeCleanupPending = pending;
+  const note = `Worktree cleanup pending (${pending.reason}) at ${pending.path}; intended branch ${pending.branch} (created: ${pending.branchCreated ? "yes" : "no"}).`;
+  record.error = [record.error, note].filter(Boolean).join("; ").slice(0, 2048);
+}
 
 /**
  * Default max concurrent foreground (blocking) agents — `0` = unlimited, the
@@ -159,6 +172,13 @@ function occupiesForegroundSlot(
 /** Which concurrency pool a spawn is charged to, if any. */
 type Pool = "background" | "foreground";
 
+/** Additive external manager-registry spawn options. Scope references are hints, never grants. */
+export interface ManagerRegistrySpawnOptions {
+  scopeRef?: string;
+  [key: string]: unknown;
+}
+
+
 interface SpawnArgs {
   pi: ExtensionAPI;
   ctx: ExtensionContext;
@@ -167,12 +187,30 @@ interface SpawnArgs {
   options: SpawnOptions;
 }
 
+const INTERNAL_SCHEDULED_SPAWN = Symbol("pi-subagents.internal-scheduled-spawn");
+
 interface SpawnOptions {
+  [INTERNAL_SCHEDULED_SPAWN]?: object;
   description: string;
   /** Diagnostic entry point; defaults to the manager method. */
   guardEntryPath?: GuardEntryPathId;
-  /** Retained bridge reference forwarded to child construction options. */
+  /** Retained frozen registration identity forwarded to child construction. */
   guardBridgeRegistration?: GuardBridgeRegistration;
+  guardRegistrationSnapshot?: object;
+  /** Evidence captured at the outermost ingress for this child operation. */
+  guardIngressEvidence?: GuardIngressEvidence;
+  /** Parent context for an ephemeral child-run that has no manager record. */
+  guardParentContext?: GuardChildContext;
+  /** Optional external scope reference; absence remains explicitly unresolved. */
+  /** Retained schedule ingress correlation; used only by the scheduler fire adapter. */
+  guardIngressId?: string;
+  guardOrigin?: GuardOrigin;
+
+  scopeRef?: string;
+  /** Scheduled-scope resolution is explicit and never inferred from disk fields. */
+  guardScopeRefStatus?: GuardChildScopeRefStatus;
+  scheduled?: { jobId: string; runIndex: number; expiresAt: string };
+
   /**
    * Optional memorable name for this instance, becoming a second handle
    * (`@auth-audit`) alongside the type-derived one. Slugged, not validated —
@@ -311,8 +349,14 @@ interface SpawnOptions {
 interface ResumeOptions {
   /** Diagnostic entry point; defaults to the manager method. */
   guardEntryPath?: GuardEntryPathId;
-  /** Retained bridge reference forwarded to child construction options. */
+  /** Retained frozen registration identity forwarded to resumeAgent. */
   guardBridgeRegistration?: GuardBridgeRegistration;
+  guardRegistrationSnapshot?: object;
+  guardParentContext?: GuardChildContext;
+
+  guardIngressEvidence?: GuardIngressEvidence;
+  scopeRef?: string;
+
   /**
    * Run the resumed turn detached in the background: return immediately with
    * the record still "running" (or "queued" at the concurrency limit) and
@@ -340,6 +384,8 @@ interface ResumeOptions {
 
 /** Best-effort ceiling on one child's shutdown handlers, so teardown can't strand a quit. */
 const CHILD_SHUTDOWN_TIMEOUT_MS = 3_000;
+/** Maximum UI wait for one guarded worktree cleanup review before recovery coordinates are recorded. */
+const WORKTREE_REVIEW_TIMEOUT_MS = 10 * 60_000;
 
 /**
  * Close the extension lifecycle `runAgent` opened with `bindExtensions`, then dispose.
@@ -350,7 +396,7 @@ const CHILD_SHUTDOWN_TIMEOUT_MS = 3_000;
  * extension armed in `session_start` leaks once per spawn, and its next tick throws
  * `assertActive()` from a bare timer callback — an uncaughtException that kills pi (#242).
  */
-async function shutdownChildSession(session: AgentSession | undefined): Promise<void> {
+export async function shutdownChildSession(session: AgentSession | undefined): Promise<void> {
   try {
     const runner = session?.extensionRunner;
     // Optional all the way down: on a pi without the getter, or a stubbed session from a
@@ -368,6 +414,65 @@ async function shutdownChildSession(session: AgentSession | undefined): Promise<
   // Always, even on timeout: disposal is what this function ultimately exists to do.
   try { session?.dispose?.(); } catch { /* ignore */ }
 }
+
+function guardOriginForEntryPath(entryPath: GuardEntryPathId): GuardOrigin {
+  if (entryPath.startsWith("mention.") || entryPath.startsWith("conversation-viewer.") || entryPath.startsWith("fleet-viewer.") || entryPath === "agents-command.generate-definition") return "human";
+  if (entryPath === "cross-extension-rpc.spawn" || entryPath === "manager-registry.spawn") return "extension-request";
+  if (entryPath === "agent-runner.turn-limit-steer") return "package-system-control";
+  if (entryPath === "scheduled-task.fire") return "package-system-control";
+  return "parent-model-delegation";
+}
+
+function childContextFailure(entryPath: GuardEntryPathId): GuardBridgeRejection {
+  return new GuardBridgeRejection(
+    "guard-child-context-failed",
+    entryPath,
+    `guard-child-context-failed: guarded work is unavailable at ${entryPath}; child context callback failed validation; child dispatch was stopped.`,
+  );
+}
+
+function childInjectionFailure(entryPath: GuardEntryPathId): GuardBridgeRejection {
+  return new GuardBridgeRejection(
+    "guard-child-injection-failed",
+    entryPath,
+    `guard-child-injection-failed: guarded work is unavailable at ${entryPath}; child guard injection could not be prepared.`,
+  );
+}
+
+
+type AbortRace<T> = { aborted: true } | { aborted: false; value: T };
+
+/** Observe callback rejection even when abort wins, while ignoring any late value. */
+function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<AbortRace<T>> {
+  const observed = Promise.resolve(promise);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve({ aborted: true });
+    };
+    observed.then(
+      value => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve({ aborted: false, value });
+      },
+      error => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      },
+    );
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 
 export class AgentManager {
   /** Direct-reference registration state shared by manager entry paths. */
@@ -401,9 +506,93 @@ export class AgentManager {
     this.guardBridgeHost.setGuardRegistrantDiagnostic(diagnostic);
   }
 
+  setHeadless(headless: boolean): void {
+    this.headless = headless;
+  }
+
 
   assertGuard(entryPath: GuardEntryPathId): GuardBridgeRegistration | undefined {
     return this.guardBridgeHost.assertGuard(entryPath);
+  }
+
+  /** Capture the exact registration identity used by a process boundary. */
+  getGuardEffectSnapshot(childId?: string): object | undefined {
+    if (!this.guardBridgeHost.guardExpected) return undefined;
+    if (childId !== undefined) {
+      const record = this.agents.get(childId);
+      return record ? this.guardEffectSnapshots.get(record) : undefined;
+    }
+    return this.guardBridgeHost.getResourceEnrollmentSnapshotIdentity();
+  }
+
+  /** Synchronous last check immediately before a guarded process is started. */
+  assertGuardEffectSnapshotActive(snapshot: object | undefined, entryPath: GuardEntryPathId): void {
+    if (!this.guardBridgeHost.guardExpected) return;
+    try {
+      this.guardBridgeHost.assertRegistrationSnapshotActive(snapshot, entryPath);
+    } catch {
+      throw new GuardBridgeRejection(
+        "guard-effect-unavailable", entryPath,
+        `guard-effect-unavailable: guarded work is unavailable at ${entryPath}; the validated registration changed before execution.`,
+      );
+    }
+  }
+
+  /** Review one concrete process effect using the registration captured for its child. */
+  async reviewGuardEffect(
+    effect: GuardEffectDescription,
+    options: { entryPath: GuardEntryPathId; childId?: string; ingressId?: string; snapshot?: object; signal?: AbortSignal; childContext?: GuardChildContext; workflowId?: string },
+  ): Promise<void> {
+    if (!this.guardBridgeHost.guardExpected) return;
+    const record = options.childId ? this.agents.get(options.childId) : undefined;
+    const snapshot = options.snapshot ?? (record ? this.guardEffectSnapshots.get(record) : this.guardBridgeHost.getResourceEnrollmentSnapshotIdentity());
+    if (options.childId && !options.snapshot && !record) {
+      this.guardBridgeHost.assertRegistrationSnapshotActive(undefined, options.entryPath);
+    }
+    const bounded = (value: string | undefined, max: number): value is string | undefined => value === undefined || (value.length <= max && !value.includes("\0"));
+    const argv = [...effect.argv];
+    const allEnvKeys = [...effect.envKeys].sort();
+    const envKeys = allEnvKeys.slice(0, 128);
+    const resources = Object.freeze({ ...effect.resources });
+    if (
+      !bounded(effect.command, 8192) || !bounded(effect.cwd, 4096) || argv.length > 128 ||
+      argv.some(value => !bounded(value, 8192)) || allEnvKeys.some(key => !bounded(key, 256)) ||
+      Object.values(resources).some(value => !bounded(value, 4096))
+    ) {
+      throw new GuardBridgeRejection(
+        "guard-effect-unavailable", options.entryPath,
+        `guard-effect-unavailable: guarded work is unavailable at ${options.entryPath}; the concrete effect request exceeded its bounds.`,
+      );
+    }
+    // Ownership claims are accepted only for explicit fork bookkeeping results.
+    const ownedByPackage = effect.ownedByPackage === true && effect.boundTo === "owned-resources";
+    const childContext = record?.guardChildContext ?? options.childContext;
+    const request: GuardEffectRequest = Object.freeze({
+      effectId: randomUUID(),
+      entryPath: options.entryPath,
+      kind: effect.kind,
+      command: effect.command,
+      argv: Object.freeze(argv),
+      cwd: effect.cwd,
+      envKeys: Object.freeze(envKeys),
+      ...(allEnvKeys.length > envKeys.length ? { envKeysTruncated: true as const, envKeysTotalCount: allEnvKeys.length } : {}),
+      ...(effect.readOnly === true && isForkReadOnlyGitCommand(effect.command, argv) ? { readOnly: true as const } : {}),
+      ...(record && this.scheduledSpawnRecords.has(record) ? { scheduled: true as const } : {}),
+      headless: this.headless,
+      resources,
+      ownedByPackage,
+      boundTo: ownedByPackage ? "owned-resources" : "unbounded",
+      ...(record ? { childId: record.id } : options.childId ? { childId: options.childId } : {}),
+      ...(childContext ? {
+        parentId: childContext.parentId,
+        delegationId: childContext.delegationId,
+        childContext,
+      } : {}),
+      ...(options.ingressId ?? (record ? this.guardEffectIngressIds.get(record) : undefined)
+        ? { ingressId: options.ingressId ?? this.guardEffectIngressIds.get(record!) } : {}),
+      ...(record?.workflowId ?? options.workflowId ? { workflowId: record?.workflowId ?? options.workflowId } : {}),
+    });
+    await this.guardBridgeHost.reviewEffect(request, snapshot, options.entryPath, options.signal);
   }
 
   captureIngress(input: GuardIngressInput): GuardIngressEvidence | Promise<GuardIngressEvidence> | undefined {
@@ -422,8 +611,39 @@ export class AgentManager {
     this.guardBridgeHost.assertIngressCaptureActive(evidence, entryPath);
   }
 
+  async createGuardChildInjection(
+    context: GuardChildContext,
+    entryPath: GuardEntryPathId,
+    snapshot: object | undefined,
+    signal?: AbortSignal,
+  ): Promise<PreparedGuardChildInjection | undefined> {
+    if (!this.guardBridgeHost.guardExpected) return undefined;
+    this.guardBridgeHost.assertChildInjectionSnapshot(snapshot, entryPath);
+    if (signal?.aborted) return undefined;
+    const pending = this.guardBridgeHost.createChildGuardExtension(context, snapshot, entryPath);
+    if (!signal) return withGuardChildInjectionTimeout(pending, entryPath);
+    const result = await raceWithAbort(pending, signal);
+    return result.aborted ? undefined : result.value;
+  }
+
+
+
+  private disposed = false;
+  private readonly scheduledSpawnCapability = Object.freeze({});
+  /** Creation review/lifetime signals retained until createWorktree settles. */
+  private worktreeLifetimeControllers = new Set<AbortController>();
+  /** Active cleanup reviews, cancellable without interrupting an in-flight Git command. */
+  private worktreeReviewControllers = new Set<AbortController>();
+  private activeWorktreeReviewControllers = new Map<string, AbortController>();
+  private activeWorktreeCleanups = new Set<string>();
+  private cancelledWorktreeCleanups = new Set<string>();
 
   private agents = new Map<string, AgentRecord>();
+  private guardEffectSnapshots = new WeakMap<AgentRecord, object>();
+  private guardEffectIngressIds = new WeakMap<AgentRecord, string>();
+  private scheduledSpawnRecords = new WeakSet<AgentRecord>();
+  /** Guarded resumes awaiting their child-context callback, before a turn starts. */
+  private guardResumeInFlight = new Set<string>();
   private cleanupInterval: ReturnType<typeof setInterval>;
   private onComplete?: OnAgentComplete;
   private onStart?: OnAgentStart;
@@ -431,6 +651,7 @@ export class AgentManager {
   private onUsage?: OnAgentUsage;
   private maxConcurrent: number;
   private maxConcurrentForeground = DEFAULT_MAX_CONCURRENT_FOREGROUND;
+  private headless = false;
   /** Base repos worktrees were created from — so dispose() can prune them all,
    *  not just the parent repo (caller-supplied cwd can target other repos). */
   private worktreeRepos = new Set<string>();
@@ -548,6 +769,24 @@ export class AgentManager {
    * Callers that must fail a tool call on a startup failure await
    * `awaitStartup(id)`; everyone else sees it on the record (status "error").
    */
+  /** Internal scheduler-only spawn path. Its unforgeable symbol is never an option exposed over RPC. */
+  spawnScheduled(
+    pi: ExtensionAPI,
+    ctx: ExtensionContext,
+    type: SubagentType,
+    prompt: string,
+    options: SpawnOptions,
+  ): string {
+    if (!this.guardBridgeHost.guardExpected || this.guardBridgeHost.getValidatedRegistrationSnapshot() === undefined) {
+      return this.spawn(pi, ctx, type, prompt, options);
+    }
+    return this.spawn(pi, ctx, type, prompt, {
+      ...options,
+      guardEntryPath: "scheduled-task.fire",
+      [INTERNAL_SCHEDULED_SPAWN]: this.scheduledSpawnCapability,
+    });
+  }
+
   spawn(
     pi: ExtensionAPI,
     ctx: ExtensionContext,
@@ -555,7 +794,22 @@ export class AgentManager {
     prompt: string,
     options: SpawnOptions,
   ): string {
-    const registration = this.assertGuard(options.guardEntryPath ?? "agent-manager.spawn");
+    const guardedRegistrationActive = this.guardBridgeHost.guardExpected &&
+      this.guardBridgeHost.getValidatedRegistrationSnapshot() !== undefined;
+
+    const internalScheduledSpawn = options[INTERNAL_SCHEDULED_SPAWN] === this.scheduledSpawnCapability;
+    // The following gate rejects every caller-supplied scheduled payload unless
+    // it carries this manager-local capability.
+    if (guardedRegistrationActive && (options.scheduled !== undefined || options.guardEntryPath === "scheduled-task.fire") && !internalScheduledSpawn) {
+      throw new GuardBridgeRejection(
+        "guard-effect-unavailable", "scheduled-task.fire",
+        "guard-effect-unavailable: guarded work is unavailable at scheduled-task.fire; only the scheduler may fire a scheduled child.",
+      );
+    }
+    const entryPath = options.guardEntryPath ?? "agent-manager.spawn";
+    const registration = this.assertGuard(entryPath);
+    const registrationSnapshot = this.guardBridgeHost.getResourceEnrollmentSnapshotIdentity();
+    const validatedRegistration = this.guardBridgeHost.getValidatedRegistrationSnapshot();
     // Validate before the queue branch — a queued spawn should fail at the
     // call, not minutes later at drain. Throw (not warn): programmatic callers
     // can fix and retry; the RPC layer converts throws into error envelopes.
@@ -563,6 +817,10 @@ export class AgentManager {
 
     const id = randomUUID().slice(0, 17);
     const abortController = new AbortController();
+    const currentSessionId = registration !== undefined && this.guardBridgeHost.guardExpected
+      ? (ctx as any)?.sessionManager?.getSessionId?.()
+      : undefined;
+    const rootSessionId = options.rootSessionId ?? (typeof currentSessionId === "string" && currentSessionId ? currentSessionId : undefined);
     const record: AgentRecord = {
       id,
       type,
@@ -603,9 +861,18 @@ export class AgentManager {
       parentAgentId: options.parentAgentId,
       workflowId: options.workflowId,
       maxSubagentDepth: options.maxSubagentDepth,
-      rootSessionId: options.rootSessionId,
+      rootSessionId,
+      ...(registration !== undefined && this.guardBridgeHost.guardExpected ? {
+        guardChildContextOptions: {
+          inheritContext: options.inheritContext === true,
+          isolatedExtensions: options.isolated === true,
+          worktree: options.isolation === "worktree",
+        },
+      } : {}),
+
     };
     this.agents.set(id, record);
+    if (internalScheduledSpawn) this.scheduledSpawnRecords.add(record);
     // After the insert, so `takenHandles()` already counts this record's own
     // handle — a spawn named after its own type gets `explore-2`, not a
     // duplicate `explore` that would make resolution ambiguous.
@@ -613,9 +880,15 @@ export class AgentManager {
       record.alias = assignHandle(handleBase(options.name), this.takenHandles());
     }
 
-    const spawnOptions = registration !== undefined
-      ? { ...options, guardBridgeRegistration: registration }
-      : options;
+    const spawnOptions = { ...options };
+    delete spawnOptions.guardBridgeRegistration;
+    delete spawnOptions.guardRegistrationSnapshot;
+    if (registration !== undefined) {
+      spawnOptions.guardBridgeRegistration = this.guardBridgeHost.guardExpected
+        ? validatedRegistration
+        : registration;
+      if (this.guardBridgeHost.guardExpected) spawnOptions.guardRegistrationSnapshot = registrationSnapshot;
+    }
     const args: SpawnArgs = { pi, ctx, type, prompt, options: spawnOptions };
 
     const pool = this.poolFor(record);
@@ -690,7 +963,24 @@ export class AgentManager {
       () => { this.startups.delete(id); },
       (err) => {
         this.startups.delete(id);
-        if (queuedPool !== undefined) {
+        if (err instanceof GuardBridgeRejection && (err.reasonCode === "guard-child-context-failed" || err.reasonCode === "guard-child-injection-failed")) {
+          if (record.blocking && queuedPool === "foreground") record.resultConsumed = true;
+          if (queuedPool === undefined && args.options.guardEntryPath === "manager-registry.spawn") {
+            record.status = "error";
+            record.error = err.message;
+            record.completedAt = Date.now();
+            this.onComplete?.(record);
+          } else if (queuedPool === undefined) {
+            this.agents.delete(id);
+          } else {
+            record.status = "error";
+
+            record.error = err.message;
+            record.completedAt = Date.now();
+            this.onComplete?.(record);
+          }
+        } else if (queuedPool !== undefined) {
+
           // Mirrors settleRun: an inline caller gets this failure as a throw
           // out of spawnAndWait, so an unconsumed record would ALSO nudge the
           // session about it — the same failure reported twice.
@@ -735,37 +1025,60 @@ export class AgentManager {
     args: SpawnArgs,
   ) {
     const { pi, ctx, type, prompt } = args;
+    const entryPath = args.options.guardEntryPath ?? "agent-manager.spawn";
+    const internalScheduledSpawn = args.options[INTERNAL_SCHEDULED_SPAWN] === this.scheduledSpawnCapability;
+    if ((args.options.scheduled !== undefined || entryPath === "scheduled-task.fire") && !internalScheduledSpawn) {
+      throw new GuardBridgeRejection(
+        "guard-effect-unavailable", "scheduled-task.fire",
+        "guard-effect-unavailable: guarded work is unavailable at scheduled-task.fire; only the scheduler may fire a scheduled child.",
+      );
+    }
+    if (this.guardBridgeHost.guardExpected) {
+      this.guardBridgeHost.assertChildInjectionSnapshot(args.options.guardRegistrationSnapshot, entryPath);
+      if (args.options.guardBridgeRegistration !== this.guardBridgeHost.getValidatedRegistrationSnapshot()) {
+        throw childInjectionFailure(entryPath);
+      }
+    }
     // Queue wait can outlive the guard registration captured by spawn(). Re-check
     // at drain time before touching the record or creating a child session.
-    const registration = this.assertGuard(args.options.guardEntryPath ?? "agent-manager.spawn");
+    const registration = this.assertGuard(entryPath);
+    if (this.guardBridgeHost.guardExpected && args.options.guardRegistrationSnapshot) {
+      this.guardEffectSnapshots.set(record, args.options.guardRegistrationSnapshot);
+    }
+    const effectIngressId = args.options.guardIngressEvidence?.ingressId ?? args.options.guardIngressId;
+    if (effectIngressId) this.guardEffectIngressIds.set(record, effectIngressId);
+
     const options = { ...args.options };
+    delete options[INTERNAL_SCHEDULED_SPAWN];
     delete options.guardBridgeRegistration;
-    if (registration !== undefined) options.guardBridgeRegistration = registration;
+    delete options.guardRegistrationSnapshot;
+    delete options.guardEntryPath;
+
+    if (registration !== undefined && !this.guardBridgeHost.guardExpected) options.guardBridgeRegistration = registration;
+    if (this.guardBridgeHost.guardExpected) {
+      options.guardBridgeRegistration = args.options.guardBridgeRegistration;
+      options.guardRegistrationSnapshot = args.options.guardRegistrationSnapshot;
+    }
+
+    delete options.guardIngressEvidence;
+    delete options.guardParentContext;
+    delete options.scopeRef;
+    delete options.guardIngressId;
+    delete options.guardOrigin;
+
 
     // spawn()'s check, and the directory may be gone by then (TOCTOU). Same
     // curated errors; drainQueue parks a throw on the record as an error.
     assertValidSpawnCwd(options.cwd);
-    // Single resolution point for the caller-supplied cwd — the worktree base
-    // repo and both cleanup calls below MUST agree on this value forever.
-    const customCwd = options.cwd ?? undefined; // null (RPC "unset") → undefined
-    const baseCwd = customCwd ?? ctx.cwd;
 
-    // Take the running state — and with it the concurrency slot — BEFORE the
-    // first await. Creating a worktree is an awaited git call, and drainQueue
-    // reads the pool counters synchronously in a loop: incrementing after the
-    // await would let it start every queued agent at once while the first is
-    // still copying its repo. Claiming "running" here also keeps abort() and
-    // abortAll() able to reach an agent whose worktree is still being created.
-    //
-    // The pool is resolved ONCE, here, and carried to `settleRun` below:
-    // `poolFor` reads `maxConcurrentForeground`, which the user can change from
-    // `/agents → Settings` mid-run, so recomputing it at settle time would
-    // decrement a pool this run never charged (counter underflow, limit
-    // silently lifted) or skip the decrement for one it did (leaked slot —
-    // every later blocking spawn queues forever). The two startup exits below
-    // never reach `settleRun`, so they hand the slot back themselves.
+    // Claim the slot before the child-context callback can await. A pending
+    // guard callback must neither let another queued spawn take this slot nor
+    // leave abort() unable to reach this startup.
     const pool = this.poolFor(record);
+    let slotReleased = false;
     const releaseSlot = () => {
+      if (slotReleased) return;
+      slotReleased = true;
       if (pool === "background") this.runningBackground--;
       else if (pool === "foreground") this.runningForeground--;
     };
@@ -775,16 +1088,218 @@ export class AgentManager {
     if (pool === "background") this.runningBackground++;
     else if (pool === "foreground") this.runningForeground++;
 
+    let detachParentSignal: (() => void) | undefined;
+    const detach = () => { detachParentSignal?.(); detachParentSignal = undefined; };
+    const wireParentSignal = () => {
+      if (!options.signal) return;
+      if (options.signal.aborted) this.abort(id);
+      else {
+        const onParentAbort = () => this.abort(id);
+        options.signal.addEventListener("abort", onParentAbort, { once: true });
+        detachParentSignal = () => options.signal!.removeEventListener("abort", onParentAbort);
+      }
+    };
+    const guardedContextRequired = registration !== undefined && this.guardBridgeHost.guardExpected;
+    const finishAbortedContextStartup = () => {
+      detach();
+      releaseSlot();
+      if (record.blocking) record.resultConsumed = true;
+      if (!this.disposed) this.drainQueue();
+      try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
+    };
+
+    // Guarded context creation must be abortable before user code can start. Keep
+    // the upstream signal-wiring point below for guard-off differential parity.
+    if (guardedContextRequired) {
+      wireParentSignal();
+      if (record.status !== "running") {
+        finishAbortedContextStartup();
+        return;
+      }
+      try {
+        const evidence = args.options.guardIngressEvidence;
+        if (evidence) this.guardBridgeHost.assertIngressCaptureActive(evidence, entryPath);
+        const parentRecord = args.options.parentAgentId !== undefined ? this.agents.get(args.options.parentAgentId) : undefined;
+        const parentContext = args.options.guardParentContext ?? parentRecord?.guardChildContext;
+        if (args.options.parentAgentId !== undefined && !parentContext) throw childContextFailure(entryPath);
+        if (parentContext && parentContext.bridgeRef !== registration) throw childContextFailure(entryPath);
+        const internalScheduledSpawn = args.options[INTERNAL_SCHEDULED_SPAWN] === this.scheduledSpawnCapability;
+        const scheduled = internalScheduledSpawn ? args.options.scheduled : undefined;
+        const scopeRef = typeof args.options.scopeRef === "string" ? args.options.scopeRef.trim().slice(0, 512) : undefined;
+        const origin = evidence?.origin ?? args.options.guardOrigin ?? guardOriginForEntryPath(entryPath);
+        const rootMarker = args.options.rootSessionId ?? record.rootSessionId ?? "unknown";
+        const callback = this.guardBridgeHost.createChildContext({
+          childId: id,
+          parentId: args.options.parentAgentId ?? parentContext?.childId ?? `root:${rootMarker}`,
+          origin,
+          entryPath,
+          operation: "spawn",
+          ...((evidence?.ingressId ?? args.options.guardIngressId) ? { ingressId: evidence?.ingressId ?? args.options.guardIngressId } : {}),
+          ...(parentContext ? { parentContext } : {}),
+          inheritContext: args.options.inheritContext === true,
+          isolatedExtensions: args.options.isolated === true,
+          worktree: args.options.isolation === "worktree",
+          headless: this.headless,
+          ...(scheduled && scopeRef ? { scopeRef } : origin === "extension-request" && scopeRef ? { scopeRef } : {}),
+          scopeRefStatus: scheduled
+            ? args.options.guardScopeRefStatus === "provided" ? "provided" : "unresolved"
+            : origin === "extension-request" ? (scopeRef ? "unresolved" : "not-applicable") : "not-applicable",
+          ...(scheduled ? { scheduled: Object.freeze({ ...scheduled }) } : {}),
+        }, evidence);
+        const boundedCallback = args.options.scheduled ? withGuardScheduleFireTimeout(callback, entryPath) : callback;
+        const outcome = await raceWithAbort(boundedCallback, record.abortController!.signal);
+        if (this.disposed && record.status === "running") {
+          record.status = "stopped";
+          record.completedAt = Date.now();
+        }
+        if (outcome.aborted || record.status !== "running") {
+          finishAbortedContextStartup();
+          return;
+        }
+        if (!outcome.value) throw childContextFailure(entryPath);
+        record.guardChildContext = outcome.value;
+      } catch (err) {
+        if (this.disposed && record.status === "running") {
+          record.status = "stopped";
+          record.completedAt = Date.now();
+          finishAbortedContextStartup();
+          return;
+        }
+        detach();
+        releaseSlot();
+        this.drainQueue();
+        if (record.status !== "running") return;
+        throw err;
+      }
+    }
+
+    // Single resolution point for the caller-supplied cwd — the worktree base
+    // repo and both cleanup calls below MUST agree on this value forever.
+    const customCwd = options.cwd ?? undefined; // null (RPC "unset") → undefined
+    const baseCwd = customCwd ?? ctx.cwd;
+
     // Worktree isolation: try to create a temporary git worktree. Strict —
     // fail loud if not possible (no silent fallback to main tree). Done BEFORE
     // the run is kicked off so a failure doesn't leave a half-running agent.
     // The project switch is enforced here as well as at the tool boundary
     // because cross-extension RPC forwards its options unvalidated — a schema
     // that omits the field can't stop a caller that never saw the schema.
+    const effectReviewer = guardedContextRequired
+      ? (effect: GuardEffectDescription, effectEntryPath: GuardEntryPathId, signal: AbortSignal = record.abortController!.signal) => this.reviewGuardEffect(effect, {
+          entryPath: effectEntryPath, childId: id, ingressId: effectIngressId,
+          snapshot: args.options.guardRegistrationSnapshot, signal,
+          childContext: record.guardChildContext, workflowId: record.workflowId,
+        })
+      : undefined;
+    const worktreeHooks: WorktreeEffectHooks | undefined = effectReviewer ? {
+      childId: id,
+      delegationId: record.guardChildContext?.delegationId,
+      parentWorkspace: ctx.cwd,
+      signal: record.abortController!.signal,
+      reviewEffect: effectReviewer,
+      assertSnapshotActive: effectEntryPath => this.assertGuardEffectSnapshotActive(args.options.guardRegistrationSnapshot, effectEntryPath),
+    } : undefined;
+    const createCleanupHooks = (): { hooks?: WorktreeEffectHooks; release: () => void } => {
+      if (!worktreeHooks || !effectReviewer) return { release: () => {} };
+      // Abort cancels an active review only. Git commands use their own deadline
+      // and are deliberately not linked to the child signal, so commit cannot be
+      // interrupted halfway through by Stop, Esc, abortAll, or a parent abort.
+      this.activeWorktreeCleanups.add(id);
+      return {
+        hooks: {
+          ...worktreeHooks,
+          signal: undefined,
+          commandSignal: undefined,
+          reviewEffect: async (effect, entryPath) => {
+            if (this.cancelledWorktreeCleanups.has(id)) {
+              throw new GuardBridgeRejection(
+                "guard-effect-cancelled", entryPath,
+                `guard-effect-cancelled: guarded work is unavailable at ${entryPath}; cleanup review was cancelled before execution.`,
+              );
+            }
+            const reviewController = new AbortController();
+            this.worktreeReviewControllers.add(reviewController);
+            this.activeWorktreeReviewControllers.set(id, reviewController);
+            let reviewTimedOut = false;
+            const reviewTimer = setTimeout(() => {
+              reviewTimedOut = true;
+              reviewController.abort();
+            }, WORKTREE_REVIEW_TIMEOUT_MS);
+            reviewTimer.unref?.();
+            try {
+              const outcome = await raceWithAbort(
+                effectReviewer(effect, entryPath, reviewController.signal),
+                reviewController.signal,
+              );
+              if (reviewTimedOut) {
+                throw new GuardBridgeRejection(
+                  "guard-effect-unavailable", entryPath,
+                  `guard-effect-unavailable: guarded work is unavailable at ${entryPath}; cleanup review exceeded its 10-minute limit.`,
+                );
+              }
+              if (outcome.aborted) {
+                throw new GuardBridgeRejection(
+                  "guard-effect-cancelled", entryPath,
+                  `guard-effect-cancelled: guarded work is unavailable at ${entryPath}; cleanup review was cancelled before execution.`,
+                );
+              }
+            } finally {
+              clearTimeout(reviewTimer);
+              this.worktreeReviewControllers.delete(reviewController);
+              if (this.activeWorktreeReviewControllers.get(id) === reviewController) this.activeWorktreeReviewControllers.delete(id);
+            }
+          },
+        },
+        release: () => {
+          this.activeWorktreeCleanups.delete(id);
+          this.cancelledWorktreeCleanups.delete(id);
+        },
+      };
+    };
+
     let worktreeCwd: string | undefined;
     if (options.isolation === "worktree" && isWorktreeIsolationEnabled()) {
-      const wt = await createWorktree(pi, baseCwd, id);
+      let wt: Awaited<ReturnType<typeof createWorktree>>;
+      // Review can take as long as the UI needs. Each Git command starts its
+      // own 30-second deadline only after its review has completed.
+      const creationController = worktreeHooks ? record.abortController! : undefined;
+      if (creationController) this.worktreeLifetimeControllers.add(creationController);
+      try {
+        wt = worktreeHooks
+          ? await createWorktree(pi, baseCwd, id, worktreeHooks)
+          : await createWorktree(pi, baseCwd, id);
+      } catch (err) {
+        if (this.disposed || guardedContextRequired && record.status !== "running") {
+          if (record.status === "running") {
+            record.status = "stopped";
+            record.completedAt = Date.now();
+          }
+          record.error = err instanceof Error ? err.message.slice(0, 512) : "Worktree creation stopped.";
+          finishAbortedContextStartup();
+          return;
+        }
+        if (guardedContextRequired) {
+          detach();
+          releaseSlot();
+        }
+        throw err;
+      } finally {
+        if (creationController) this.worktreeLifetimeControllers.delete(creationController);
+      }
+      if (this.disposed && record.status === "running") {
+        record.status = "stopped";
+        record.completedAt = Date.now();
+      }
       if (!wt) {
+        if (this.disposed || record.status !== "running") {
+          if (record.status === "running") {
+            record.status = "stopped";
+            record.completedAt = Date.now();
+          }
+          finishAbortedContextStartup();
+          return;
+        }
+        detach();
         releaseSlot();
         throw new Error(
           'Cannot run with isolation: "worktree" — not a git repo, no commits yet, or `git worktree add` failed. ' +
@@ -807,29 +1322,30 @@ export class AgentManager {
       // burn tokens on work nobody is waiting for: discard the fresh (and by
       // definition unchanged) worktree instead.
       if (record.status !== "running") {
-        releaseSlot();
-        record.worktreeResult = await cleanupWorktree(pi, baseCwd, wt, options.description);
-        this.drainQueue();
+        if (!worktreeHooks) {
+          detach();
+          releaseSlot();
+          record.worktreeResult = await cleanupWorktree(pi, baseCwd, wt, options.description);
+          this.drainQueue();
+          return;
+        }
+        const cleanup = createCleanupHooks();
+        try {
+          record.worktreeResult = await cleanupWorktree(pi, baseCwd, wt, options.description, cleanup.hooks);
+        } catch (error) {
+          if (guardedContextRequired && this.guardBridgeHost.guardExpected && registration !== undefined) {
+            recordWorktreeCleanupPending(record, wt, error);
+          }
+        } finally {
+          cleanup.release();
+          finishAbortedContextStartup();
+        }
         return;
       }
     }
 
     this.onStart?.(record);
-
-    // Wire parent abort signal to stop the subagent when the parent is interrupted
-    let detachParentSignal: (() => void) | undefined;
-    if (options.signal) {
-      // A queued spawn can start minutes after the caller handed us its signal,
-      // by which time it may already be aborted — and `addEventListener` would
-      // never fire, leaving a child the parent can no longer reach.
-      if (options.signal.aborted) this.abort(id);
-      else {
-        const onParentAbort = () => this.abort(id);
-        options.signal.addEventListener("abort", onParentAbort, { once: true });
-        detachParentSignal = () => options.signal!.removeEventListener("abort", onParentAbort);
-      }
-    }
-    const detach = () => { detachParentSignal?.(); detachParentSignal = undefined; };
+    if (!guardedContextRequired) wireParentSignal();
 
     const promise = runAgent(ctx, type, prompt, {
       pi,
@@ -842,8 +1358,17 @@ export class AgentManager {
       structuredOutput: options.structuredOutput,
       resumeSessionFile: options.resumeSessionFile,
       ...(options.guardBridgeRegistration !== undefined ? { guardBridgeRegistration: options.guardBridgeRegistration } : {}),
+      ...(options.guardRegistrationSnapshot !== undefined ? { guardRegistrationSnapshot: options.guardRegistrationSnapshot } : {}),
+
+      ...(record.guardChildContext !== undefined ? { guardChildContext: record.guardChildContext } : {}),
+
       guardBridgeHost: this.guardBridgeHost,
       guardExpected: this.guardBridgeHost.guardExpected,
+      ...(effectReviewer ? {
+        reviewGuardEffect: effectReviewer,
+        assertGuardEffectActive: (effectEntryPath: GuardEntryPathId) =>
+          this.assertGuardEffectSnapshotActive(args.options.guardRegistrationSnapshot, effectEntryPath),
+      } : {}),
       nested: options.parentAgentId !== undefined,
       workflow: options.workflowId !== undefined,
       // Worktree wins for the working dir (the agent must run in the copy —
@@ -883,6 +1408,10 @@ export class AgentManager {
         if (record.pendingSteers?.length) this.assertGuard("agent-manager.pending-steer");
 
         record.session = session;
+        if (record.guardChildContext && session.agent?.state) {
+          (session.agent.state as typeof session.agent.state & { guardChildContext?: GuardChildContext }).guardChildContext = record.guardChildContext;
+        }
+
         // Capture now, while the session object exists: after eviction this
         // path is the only thing that can reopen the conversation, and an
         // in-memory session reports undefined, which correctly means
@@ -916,10 +1445,13 @@ export class AgentManager {
         }
         // Flush any steers that arrived before the session was ready
         if (record.pendingSteers?.length) {
-          for (const msg of record.pendingSteers) {
-            session.steer(msg).catch(() => {});
+          for (let index = 0; index < record.pendingSteers.length; index++) {
+            const evidence = record.pendingSteerEvidence?.[index];
+            if (evidence) this.guardBridgeHost.assertIngressCaptureActive(evidence, "agent-manager.pending-steer");
+            session.steer(record.pendingSteers[index]).catch(() => {});
           }
           record.pendingSteers = undefined;
+          record.pendingSteerEvidence = undefined;
         }
         options.onSessionCreated?.(session);
       },
@@ -947,8 +1479,8 @@ export class AgentManager {
         record.structuredRetried = structuredRetried;
         record.session = session;
         record.completedAt ??= Date.now();
+        if (!guardedContextRequired) detach();
 
-        detach();
 
         // Final flush of streaming output file
         if (record.outputCleanup) {
@@ -966,9 +1498,21 @@ export class AgentManager {
               await options.onBeforeWorktreeCleanup(record.worktree.path);
             } catch { /* ignore — never block cleanup */ }
           }
-          const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
-          record.worktreeResult = wtResult;
-          if (wtResult.hasChanges && wtResult.branch) {
+          const cleanup = createCleanupHooks();
+          let wtResult: WorktreeCleanupResult | undefined;
+          try {
+            if (cleanup.hooks) wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description, cleanup.hooks);
+            else wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
+            record.worktreeResult = wtResult;
+          } catch (error) {
+            if (!worktreeHooks) throw error;
+            if (guardedContextRequired && this.guardBridgeHost.guardExpected && registration !== undefined) {
+              recordWorktreeCleanupPending(record, record.worktree, error);
+            }
+          } finally {
+            cleanup.release();
+          }
+          if (wtResult?.hasChanges && wtResult.branch) {
             // With a caller-supplied cwd the branch lives in THAT repo, not the
             // parent session's — say so, or the orchestrator merges in the wrong repo.
             const repoNote = customCwd !== undefined ? ` in \`${baseCwd}\`` : "";
@@ -980,6 +1524,7 @@ export class AgentManager {
           }
         }
 
+        detach();
         this.abortOwnedChildren(id);
 
         this.settleRun(record, true, pool);
@@ -992,8 +1537,8 @@ export class AgentManager {
         }
         record.error = err instanceof Error ? err.message : String(err);
         record.completedAt ??= Date.now();
+        if (!guardedContextRequired) detach();
 
-        detach();
 
         // Final flush of streaming output file on error
         if (record.outputCleanup) {
@@ -1003,12 +1548,22 @@ export class AgentManager {
 
         // Best-effort worktree cleanup on error
         if (record.worktree) {
+          const cleanup = createCleanupHooks();
           try {
-            const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
+            const wtResult = cleanup.hooks
+              ? await cleanupWorktree(pi, baseCwd, record.worktree, options.description, cleanup.hooks)
+              : await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
             record.worktreeResult = wtResult;
-          } catch { /* ignore cleanup errors */ }
+          } catch (error) {
+            if (guardedContextRequired && this.guardBridgeHost.guardExpected && registration !== undefined) {
+              recordWorktreeCleanupPending(record, record.worktree, error);
+            }
+          } finally {
+            cleanup.release();
+          }
         }
 
+        detach();
         this.abortOwnedChildren(id);
 
         this.settleRun(record, false, pool);
@@ -1186,18 +1741,77 @@ export class AgentManager {
   /**
    * Resume an existing agent session with a new prompt.
    */
+  private async createResumeChildContext(
+    record: AgentRecord,
+    entryPath: GuardEntryPathId,
+    options: ResumeOptions,
+  ): Promise<GuardChildContext | undefined> {
+    const registration = this.assertGuard(entryPath);
+    if (registration === undefined || !this.guardBridgeHost.guardExpected) return undefined;
+    const evidence = options.guardIngressEvidence;
+    if (evidence) this.guardBridgeHost.assertIngressCaptureActive(evidence, entryPath);
+    const parentRecord = record.parentAgentId !== undefined ? this.agents.get(record.parentAgentId) : undefined;
+    const parentContext = options.guardParentContext ?? parentRecord?.guardChildContext;
+    if (record.parentAgentId !== undefined && !parentContext) throw childContextFailure(entryPath);
+    if (parentContext && parentContext.bridgeRef !== registration) throw childContextFailure(entryPath);
+    const retained = record.guardChildContextOptions;
+    const origin = evidence?.origin ?? guardOriginForEntryPath(entryPath);
+    const scopeRef = typeof options.scopeRef === "string" ? options.scopeRef.trim() : undefined;
+    const rootMarker = record.rootSessionId ?? "unknown";
+    const context = await this.guardBridgeHost.createChildContext({
+      childId: record.id,
+      parentId: record.parentAgentId ?? parentContext?.childId ?? `root:${rootMarker}`,
+      origin,
+      entryPath,
+      operation: "resume",
+      ...(evidence?.ingressId ? { ingressId: evidence.ingressId } : {}),
+      ...(parentContext ? { parentContext } : {}),
+      inheritContext: retained?.inheritContext ?? false,
+      isolatedExtensions: retained?.isolatedExtensions ?? false,
+      worktree: retained?.worktree ?? false,
+      headless: this.headless,
+      ...(origin === "extension-request" && scopeRef ? { scopeRef } : {}),
+      scopeRefStatus: origin === "extension-request" ? (scopeRef ? "provided" : "unresolved") : "not-applicable",
+    }, evidence);
+    if (!context) throw childContextFailure(entryPath);
+    record.guardChildContext = context;
+    record.guardChildContextOptions = {
+      inheritContext: retained?.inheritContext ?? false,
+      isolatedExtensions: retained?.isolatedExtensions ?? false,
+      worktree: retained?.worktree ?? false,
+    };
+    return context;
+  }
+
+
   async resume(
     id: string,
     prompt: string,
     signal?: AbortSignal,
     options?: ResumeOptions,
   ): Promise<AgentRecord | undefined> {
-    const registration = this.assertGuard(options?.guardEntryPath ?? "agent-manager.resume");
-    const resumeOptions = registration !== undefined
-      ? { ...options, guardBridgeRegistration: registration }
-      : options;
+    const entryPath = options?.guardEntryPath ?? "agent-manager.resume";
+    const registration = this.assertGuard(entryPath);
+    const registrationSnapshot = this.guardBridgeHost.getResourceEnrollmentSnapshotIdentity();
+    const validatedRegistration = this.guardBridgeHost.getValidatedRegistrationSnapshot();
+    if (this.guardBridgeHost.guardExpected) {
+      this.guardBridgeHost.assertChildInjectionSnapshot(registrationSnapshot, entryPath);
+    }
+    let resumeOptions = options;
+    if (registration !== undefined) {
+      resumeOptions = {
+        ...options,
+        guardBridgeRegistration: this.guardBridgeHost.guardExpected ? validatedRegistration : registration,
+        ...(this.guardBridgeHost.guardExpected ? { guardRegistrationSnapshot: registrationSnapshot } : {}),
+      };
+    }
     const record = this.agents.get(id);
     if (!record?.session) return undefined;
+    if (this.guardBridgeHost.guardExpected && (
+      this.guardResumeInFlight.has(id) || record.status === "running" || record.status === "queued"
+    )) {
+      return undefined;
+    }
 
     // Background resume: settle asynchronously and notify on completion exactly
     // like a background spawn, returning immediately with the record still
@@ -1224,7 +1838,20 @@ export class AgentManager {
       record.completedAt = undefined;
       record.status = "queued";
 
-      const start = () => this.startResume(id, record, prompt, signal, resumeOptions ?? {});
+      const start = async () => {
+        const operation = this.startResume(id, record, prompt, signal, resumeOptions ?? {});
+        record.promise = operation.then(() => record.result ?? "", () => "");
+        try {
+          await operation;
+        } catch (err) {
+          record.status = "error";
+          record.error = err instanceof Error ? err.message : String(err);
+          record.completedAt = Date.now();
+          try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
+        }
+      };
+
+
       if (occupiesPoolSlot(record) && !this.poolHasRoom("background")) {
         // At the concurrency limit — queue it, drains when a slot frees. A
         // detached resume has no inline caller, hence nothing to release. The
@@ -1236,7 +1863,7 @@ export class AgentManager {
           pool: "background",
           start: async () => {
             try {
-              start();
+              await start();
             } catch (err) {
               record.status = "error";
               record.error = err instanceof Error ? err.message : String(err);
@@ -1247,17 +1874,83 @@ export class AgentManager {
           release: () => {},
         });
       } else {
-        start();
+        void start();
       }
       return record;
     }
 
+    const guardedContextRequired = registration !== undefined && this.guardBridgeHost.guardExpected;
+    let childContext: GuardChildContext | undefined;
+    let guardedAbortController: AbortController | undefined;
+    let detachGuardAbort: (() => void) | undefined;
+    if (guardedContextRequired) {
+      // Claim the record synchronously before the callback's first await. This
+      // rejects overlapping foreground/background resumes and lets abort() stop
+      // a pending context request just like a running turn.
+      record.status = "running";
+      record.startedAt = Date.now();
+      record.completedAt = undefined;
+      record.result = undefined;
+      record.error = undefined;
+      guardedAbortController = new AbortController();
+      record.abortController = guardedAbortController;
+      if (signal) {
+        if (signal.aborted) this.abort(id);
+        else {
+          const onParentAbort = () => this.abort(id);
+          signal.addEventListener("abort", onParentAbort, { once: true });
+          detachGuardAbort = () => signal.removeEventListener("abort", onParentAbort);
+        }
+      }
+      this.guardResumeInFlight.add(id);
+      try {
+        if (record.status !== "running") {
+          detachGuardAbort?.();
+          detachGuardAbort = undefined;
+          return record;
+        }
+        const callback = this.createResumeChildContext(
+          record,
+          options?.guardEntryPath ?? "agent-manager.resume",
+          resumeOptions ?? {},
+        );
+        const outcome = await raceWithAbort(callback, guardedAbortController.signal);
+        if (outcome.aborted || record.status !== "running" || this.disposed) {
+          if (this.disposed && record.status === "running") {
+            record.status = "stopped";
+            record.completedAt = Date.now();
+          }
+          detachGuardAbort?.();
+          detachGuardAbort = undefined;
+          return record;
+        }
+        childContext = outcome.value;
+        if (!childContext) throw childContextFailure(options?.guardEntryPath ?? "agent-manager.resume");
+      } catch (err) {
+        detachGuardAbort?.();
+        detachGuardAbort = undefined;
+        if (this.disposed) {
+          record.status = "stopped";
+          record.completedAt ??= Date.now();
+        } else if ((record.status as string) !== "stopped") {
+          record.status = "error";
+          record.error = err instanceof Error ? err.message : String(err);
+          record.completedAt = Date.now();
+        }
+        return record;
+      } finally {
+        this.guardResumeInFlight.delete(id);
+      }
+    }
+
     // Foreground resume: run inline and return the settled record.
-    record.status = "running";
-    record.startedAt = Date.now();
-    record.completedAt = undefined;
-    record.result = undefined;
-    record.error = undefined;
+    if (!guardedContextRequired) {
+      record.status = "running";
+      record.startedAt = Date.now();
+      record.completedAt = undefined;
+      record.result = undefined;
+      record.error = undefined;
+    }
 
     try {
       const { text, failure, aborted } = await resumeAgent(record.session, prompt, {
@@ -1275,8 +1968,11 @@ export class AgentManager {
           this.onCompact?.(record, info);
           resumeOptions?.onCompaction?.(info);
         },
-        signal,
-        ...(registration !== undefined ? { guardBridgeRegistration: registration } : {}),
+        signal: guardedAbortController?.signal ?? signal,
+        ...(registration !== undefined ? { guardBridgeRegistration: resumeOptions?.guardBridgeRegistration ?? registration } : {}),
+        ...(resumeOptions?.guardRegistrationSnapshot !== undefined ? { guardRegistrationSnapshot: resumeOptions.guardRegistrationSnapshot } : {}),
+        ...(childContext !== undefined ? { guardChildContext: childContext } : {}),
+
         guardBridgeHost: this.guardBridgeHost,
         guardExpected: this.guardBridgeHost.guardExpected,
       });
@@ -1289,9 +1985,14 @@ export class AgentManager {
       record.result = text;
       record.completedAt = Date.now();
     } catch (err) {
-      record.status = "error";
-      record.error = err instanceof Error ? err.message : String(err);
-      record.completedAt = Date.now();
+      if (!guardedContextRequired || record.status !== "stopped") {
+        record.status = "error";
+        record.error = err instanceof Error ? err.message : String(err);
+        record.completedAt = Date.now();
+      }
+      record.completedAt ??= Date.now();
+    } finally {
+      detachGuardAbort?.();
     }
 
     // Same contract as the spawn settle paths: children spawned during the
@@ -1308,7 +2009,7 @@ export class AgentManager {
    * there is no onSessionCreated to hang per-run wiring off — callers use
    * `options.onStarted`, which fires on both the immediate and the drained path.
    */
-  private startResume(
+  private async startResume(
     id: string,
     record: AgentRecord,
     prompt: string,
@@ -1317,40 +2018,123 @@ export class AgentManager {
   ) {
     // A queued resume can outlive the registration captured when it was queued.
     // Re-check before changing the record or invoking the existing session.
-    const registration = this.assertGuard(requestedOptions.guardEntryPath ?? "agent-manager.resume");
+    const entryPath = requestedOptions.guardEntryPath ?? "agent-manager.resume";
+
+    if (this.guardBridgeHost.guardExpected) {
+      this.guardBridgeHost.assertChildInjectionSnapshot(requestedOptions.guardRegistrationSnapshot, entryPath);
+    }
+    const registration = this.assertGuard(entryPath);
     const options = { ...requestedOptions };
+    delete options.guardIngressEvidence;
+    delete options.guardParentContext;
+
+    delete options.scopeRef;
     delete options.guardBridgeRegistration;
-    if (registration !== undefined) options.guardBridgeRegistration = registration;
+    delete options.guardRegistrationSnapshot;
+    if (registration !== undefined && !this.guardBridgeHost.guardExpected) options.guardBridgeRegistration = registration;
+    if (this.guardBridgeHost.guardExpected) {
+      options.guardBridgeRegistration = requestedOptions.guardBridgeRegistration;
+      options.guardRegistrationSnapshot = requestedOptions.guardRegistrationSnapshot;
+    }
     if (!record.session) return;
 
-
+    // Claim the pool slot, controller, and running state before awaiting a
+    // guarded context callback. This keeps drainQueue bounded and lets abort()
+    // reach the operation while enrollment is pending.
+    const pool = occupiesPoolSlot(record) ? "background" : undefined;
+    let slotReleased = false;
+    const releaseSlot = () => {
+      if (slotReleased) return;
+      slotReleased = true;
+      if (pool === "background") this.runningBackground--;
+    };
     record.status = "running";
     record.startedAt = Date.now();
-    if (occupiesPoolSlot(record)) this.runningBackground++;
+    const abortController = new AbortController();
+    record.abortController = abortController;
+    const guardedContextRequired = registration !== undefined && this.guardBridgeHost.guardExpected;
+    let detachParentSignal: (() => void) | undefined;
+    if (parentSignal) {
+      // Preserve upstream guard-off behavior: an already-aborted parent signal
+      // is ignored because adding a listener after abort does not replay it.
+      if (guardedContextRequired && parentSignal.aborted) this.abort(id);
+      else {
+        const onParentAbort = () => this.abort(id);
+        parentSignal.addEventListener("abort", onParentAbort, { once: true });
+        detachParentSignal = () => parentSignal.removeEventListener("abort", onParentAbort);
+      }
+    }
+    const detach = () => { detachParentSignal?.(); detachParentSignal = undefined; };
+    if (pool === "background") this.runningBackground++;
+    const finishAbortedContextResume = () => {
+      detach();
+      releaseSlot();
+      this.drainQueue();
+      try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
+    };
+    if (record.status !== "running") {
+      detach();
+      releaseSlot();
+      this.drainQueue();
+      if (guardedContextRequired) {
+        try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
+      }
+      return;
+    }
+
+    let childContext: GuardChildContext | undefined;
+    if (guardedContextRequired) {
+      this.guardResumeInFlight.add(id);
+      try {
+        const callback = this.createResumeChildContext(record, entryPath, requestedOptions);
+        const outcome = await raceWithAbort(callback, abortController.signal);
+        if (outcome.aborted || record.status !== "running" || this.disposed) {
+          if (this.disposed && record.status === "running") {
+            record.status = "stopped";
+            record.completedAt = Date.now();
+          }
+          finishAbortedContextResume();
+          return;
+        }
+        childContext = outcome.value;
+        if (!childContext) throw childContextFailure(entryPath);
+      } catch (err) {
+        if (this.disposed && record.status === "running") {
+          record.status = "stopped";
+          record.completedAt = Date.now();
+          finishAbortedContextResume();
+          return;
+        }
+        detach();
+        releaseSlot();
+        this.drainQueue();
+        if (record.status !== "running") return;
+        throw err;
+      }
+      finally {
+        this.guardResumeInFlight.delete(id);
+      }
+    }
+    if (record.status !== "running" || (guardedContextRequired && abortController.signal.aborted)) {
+      if (guardedContextRequired && (record.status as string) === "stopped") finishAbortedContextResume();
+      else {
+        detach();
+        releaseSlot();
+        this.drainQueue();
+      }
+      return;
+    }
+
     this.onStart?.(record);
 
     // Fresh abort controller so /agents stop and steering target THIS run rather
     // than the previous one's settled controller.
-    const abortController = new AbortController();
-    record.abortController = abortController;
-    // Optional, and NOT what the Agent tool passes for a detached resume: a
-    // parent signal aborts on the parent's own interrupt (user Esc), which is
-    // right for a foreground run whose result the caller is awaiting, and wrong
-    // for a detached one — background spawns omit it for exactly this reason.
-    let detachParentSignal: (() => void) | undefined;
-    if (parentSignal) {
-      const onParentAbort = () => this.abort(id);
-      parentSignal.addEventListener("abort", onParentAbort, { once: true });
-      detachParentSignal = () => parentSignal.removeEventListener("abort", onParentAbort);
-    }
-
     // Per-run side effects (output streaming) — see ResumeOptions.onStarted.
     // After the record is in its running shape, before the run is kicked off.
     try { options.onStarted?.(); } catch { /* ignore caller wiring errors */ }
 
     const settle = () => {
-      detachParentSignal?.();
-      detachParentSignal = undefined;
+      detach();
       // Final flush of streaming output file
       if (record.outputCleanup) {
         try { record.outputCleanup(); } catch { /* ignore */ }
@@ -1358,7 +2142,7 @@ export class AgentManager {
       }
       // Children spawned during the resumed turn must not outlive it.
       this.abortOwnedChildren(id);
-      if (occupiesPoolSlot(record)) this.runningBackground--;
+      releaseSlot();
       try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
       this.drainQueue();
     };
@@ -1380,6 +2164,9 @@ export class AgentManager {
       },
       signal: abortController.signal,
       ...(options.guardBridgeRegistration !== undefined ? { guardBridgeRegistration: options.guardBridgeRegistration } : {}),
+      ...(options.guardRegistrationSnapshot !== undefined ? { guardRegistrationSnapshot: options.guardRegistrationSnapshot } : {}),
+      ...(childContext !== undefined ? { guardChildContext: childContext } : {}),
+
       guardBridgeHost: this.guardBridgeHost,
       guardExpected: this.guardBridgeHost.guardExpected,
     })
@@ -1407,6 +2194,8 @@ export class AgentManager {
       });
 
     record.promise = promise;
+    await promise;
+
   }
 
   /**
@@ -1417,16 +2206,22 @@ export class AgentManager {
    * session is created. Returns false if the agent can't accept steering
    * (unknown id, or no longer running/queued).
    */
-  steer(id: string, message: string): boolean {
+  steer(id: string, message: string, evidence?: GuardIngressEvidence): boolean {
     this.assertGuard("agent-manager.steer");
     const record = this.agents.get(id);
     if (!record) return false;
     if (record.status !== "running" && record.status !== "queued") return false;
+    if (evidence) this.guardBridgeHost.assertIngressCaptureActive(evidence, "agent-manager.steer");
     if (record.session) {
       record.session.steer(message).catch(() => {});
     } else {
       if (!record.pendingSteers) record.pendingSteers = [];
       record.pendingSteers.push(message);
+      if (evidence && !record.pendingSteerEvidence) {
+        record.pendingSteerEvidence = Array.from({ length: record.pendingSteers.length - 1 }, () => undefined);
+      }
+      if (record.pendingSteerEvidence) record.pendingSteerEvidence.push(evidence);
+
     }
     return true;
   }
@@ -1520,7 +2315,12 @@ export class AgentManager {
       return true;
     }
 
-    if (record.status !== "running") return false;
+    if (record.status !== "running") {
+      if (!this.activeWorktreeCleanups.has(id)) return false;
+      this.cancelledWorktreeCleanups.add(id);
+      this.activeWorktreeReviewControllers.get(id)?.abort();
+      return true;
+    }
     record.abortController?.abort();
     record.status = "stopped";
     record.completedAt = Date.now();
@@ -1626,6 +2426,10 @@ export class AgentManager {
         record.status = "stopped";
         record.completedAt = Date.now();
         count++;
+      } else if (this.activeWorktreeCleanups.has(record.id)) {
+        this.cancelledWorktreeCleanups.add(record.id);
+        this.activeWorktreeReviewControllers.get(record.id)?.abort();
+        count++;
       }
     }
     return count;
@@ -1657,7 +2461,22 @@ export class AgentManager {
    *   it (tests, teardown of a manager that never spawned) skips the prune.
    */
   async dispose(pi?: ExtensionAPI): Promise<void> {
+    this.disposed = true;
     clearInterval(this.cleanupInterval);
+    for (const controller of this.worktreeLifetimeControllers) controller.abort();
+    this.worktreeLifetimeControllers.clear();
+    for (const controller of this.worktreeReviewControllers) controller.abort();
+    this.worktreeReviewControllers.clear();
+    for (const record of this.agents.values()) {
+      if (record.status === "running") {
+        record.abortController?.abort();
+        record.status = "stopped";
+        record.completedAt ??= Date.now();
+      } else if (record.status === "queued") {
+        record.status = "stopped";
+        record.completedAt ??= Date.now();
+      }
+    }
     // Clear queue — via dequeue, so anyone blocked in spawnAndWait is woken
     // rather than left awaiting a gate nothing will ever resolve.
     this.dequeue(() => true);
@@ -1669,7 +2488,15 @@ export class AgentManager {
       // on the shutdown path, which cannot wait for git. Started before the awaited
       // shutdown below rather than after it, so the git calls have that window to
       // finish in instead of racing the process exit that follows.
-      const prune = (repo: string) => { pruneWorktrees(pi, repo).catch(() => {}); };
+      const prune = (repo: string) => {
+        const snapshot = this.guardBridgeHost.getResourceEnrollmentSnapshotIdentity();
+        const hooks: WorktreeEffectHooks | undefined = this.guardBridgeHost.guardExpected ? {
+          childId: "", parentWorkspace: repo,
+          reviewEffect: (effect, entryPath) => this.reviewGuardEffect(effect, { entryPath, snapshot }),
+          assertSnapshotActive: entryPath => this.assertGuardEffectSnapshotActive(snapshot, entryPath),
+        } : undefined;
+        (hooks ? pruneWorktrees(pi, repo, hooks) : pruneWorktrees(pi, repo)).catch(() => {});
+      };
       prune(process.cwd());
       // Also prune repos that caller-supplied cwds created worktrees in — a clean
       // exit with in-flight agents would otherwise leave stale registrations there.
